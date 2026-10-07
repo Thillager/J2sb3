@@ -17,7 +17,7 @@ Schreibe Scratch-Projekte in einer Java-ähnlichen Syntax und kompiliere sie dir
 ## Aufruf
 
 ```bash
-python scratch_transpiler.py <eingabe.java> [Optionen]
+python Transpiler.py <eingabe.java> [Optionen]
 ```
 
 ### Flags
@@ -36,19 +36,19 @@ python scratch_transpiler.py <eingabe.java> [Optionen]
 
 ```bash
 # Einmalig kompilieren
-python scratch_transpiler.py meinSpiel.java
+python Transpiler.py meinSpiel.java
 
 # Mit Ausgabedatei
-python scratch_transpiler.py meinSpiel.java --out meinSpiel.sb3
+python Transpiler.py meinSpiel.java --out meinSpiel.sb3
 
 # Watch-Modus + TurboWarp automatisch refreshen
-python scratch_transpiler.py meinSpiel.java --watch --turbowarp-replace
+python Transpiler.py meinSpiel.java --watch --turbowarp-replace
 
 # Watch-Modus + Scratch automatisch refreshen
-python scratch_transpiler.py meinSpiel.java --watch --scratch-replace
+python Transpiler.py meinSpiel.java --watch --scratch-replace
 
 # Neue TurboWarp-Instanz öffnen (alte bleibt)
-python scratch_transpiler.py meinSpiel.java --turbowarp-new
+python Transpiler.py meinSpiel.java --turbowarp-new
 ```
 
 ---
@@ -57,7 +57,7 @@ python scratch_transpiler.py meinSpiel.java --turbowarp-new
 
 ```
 mein_projekt/
- ├── scratch_transpiler.py
+ ├── Transpiler.py
  ├── meinSpiel.java        ← dein Code
  ├── katze.png             ← Bilder im gleichen Ordner
  ├── explosion.wav         ← Sounds im gleichen Ordner
@@ -678,7 +678,7 @@ Der Transpiler gibt verständliche Fehlermeldungen **mit Zeilennummer** aus:
 Der Watch-Modus ist ideal für die Entwicklung:
 
 ```bash
-python scratch_transpiler.py meinSpiel.java --watch --turbowarp-replace
+python Transpiler.py meinSpiel.java --watch --turbowarp-replace
 ```
 
 1. TurboWarp öffnet sich mit deinem Projekt
