@@ -428,6 +428,13 @@ define zeichneQuadrat(groesse) {
     }
 }
 
+void zeichneQuadrat (groesse) {
+    repeat(4) {
+        move(groesse);
+        turnRight(90);
+    }
+}
+
 // Aufruf:
 onFlagClicked {
     zeichneQuadrat(100);

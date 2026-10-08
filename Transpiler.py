@@ -268,7 +268,7 @@ KEYWORDS = {
     "penDown","penUp","setPenColor","changePenColor",
     "setPenSize","changePenSize","stampPen","erasePen",
     "broadcast","broadcastAndWait",
-    "define",
+    "define","void","public","private",
     "addCostume","addBackdrop","addSound",
     "random","abs","floor","ceil","sqrt",
     "sin","cos","tan","asin","acos","atan","ln","log","round",
@@ -444,11 +444,31 @@ class Parser:
                 if self.peek()[1] == ",": self.consume("COMMA"); path = self.consume("STRING").strip('"')
                 self.consume("RPAREN"); self.expect_semi()
                 sounds.append({"name": sname, "path": path})
+            elif v in ("public", "private"):
+                # Sichtbarkeits-Modifier: public/private var  oder  public/private void
+                visibility = self.consume()   # consume 'public' oder 'private'
+                nv = self.peek()[1]
+                if nv == "var":
+                    decl = self.parse_var_decl()
+                    decl["visibility"] = visibility
+                    scripts.append({"event": {"type": "EventFlagClicked"}, "body": [decl]})
+                elif nv in ("void", "define"):
+                    cd = self.parse_custom_def()
+                    cd["visibility"] = visibility
+                    custom_defs.append(cd)
+                    self.custom_blocks[cd["name"]] = cd["params"]
+                else:
+                    raise SyntaxError(
+                        f"Zeile {self.current_line()}: Nach '{visibility}' erwartet "
+                        f"'var', 'void' oder 'define', gefunden '{nv}'"
+                    )
             elif v == "var":
                 decl = self.parse_var_decl()
+                decl.setdefault("visibility", "public")
                 scripts.append({"event": {"type": "EventFlagClicked"}, "body": [decl]})
-            elif v == "define":
+            elif v in ("define", "void"):
                 cd = self.parse_custom_def()
+                cd.setdefault("visibility", "public")
                 custom_defs.append(cd)
                 self.custom_blocks[cd["name"]] = cd["params"]
             elif v in ("onFlagClicked","onKeyPressed","onSpriteClicked",
@@ -493,7 +513,13 @@ class Parser:
         return stmts
 
     def parse_custom_def(self):
-        self.consume(value="define"); name = self.consume("IDENT")
+        """
+        Akzeptiert beide Syntaxformen für eigene Blöcke:
+          define blockName(param1, param2) { … }   ← bisherige Syntax
+          void   blockName(param1, param2) { … }   ← Java-style
+        """
+        self.consume()   # consume 'define' oder 'void'
+        name = self.consume("IDENT")
         self.consume("LPAREN"); params = []
         while self.peek()[1] != ")":
             params.append(self.consume("IDENT"))
@@ -956,11 +982,16 @@ class Parser:
 # ═══════════════════════════════════════════════════════
 class ScratchGenerator:
     def __init__(self):
-        self.blocks:       dict = {}
-        self.variables:    dict = {}
-        self.lists:        dict = {}
-        self.broadcasts:   dict = {}
-        self.custom_procs: dict = {}
+        self.blocks:          dict = {}
+        self.variables:       dict = {}
+        self.lists:           dict = {}
+        self.broadcasts:      dict = {}
+        self.custom_procs:    dict = {}   # name → proccode
+        self.custom_warp:     dict = {}   # name → bool (warp/private)
+        # Aktuell aktive Parameter eines Custom Blocks:
+        # name → argument_reporter Block-ID
+        # Wird in gen_custom_def gesetzt und in gen_expr genutzt.
+        self.current_params:  dict = {}
 
     def _add(self, bid, opcode, parent, nxt,
              inputs=None, fields=None, top=False, x=0, y=0, mutation=None):
@@ -1082,8 +1113,16 @@ class ScratchGenerator:
         # Variablen
         if t == "VarDecl":
             inp = self._input(node["value"], bid) if node["value"] else [1,[10,""]]
+            var_name = node["name"]
+            # private var → wird mit hideVariable-Block direkt nach der Deklaration versteckt
             self._add(bid, "data_setvariableto", parent_id, next_id,
-                inputs={"VALUE": inp}, fields={"VARIABLE": [node["name"], self._var_id(node["name"])]})
+                inputs={"VALUE": inp}, fields={"VARIABLE": [var_name, self._var_id(var_name)]})
+            if node.get("visibility") == "private":
+                # Erzeuge einen hideVariable-Block direkt dahinter
+                hide_id = new_id()
+                self._add(hide_id, "data_hidevariable", bid, next_id,
+                    fields={"VARIABLE": [var_name, self._var_id(var_name)]})
+                self.blocks[bid]["next"] = hide_id
             return bid
         if t == "VarSet":
             self._add(bid, "data_setvariableto", parent_id, next_id,
@@ -1356,9 +1395,15 @@ class ScratchGenerator:
             self._add(inner,"operator_not",parent_id,None,inputs={})
             self._add(bid,"operator_not",parent_id,None,inputs={"OPERAND":[2,inner]}); return bid
         if t == "Var":
-            vid = self._var_id(node["name"])
+            name = node["name"]
+            # Ist der Name ein Parameter des aktuellen Custom Blocks?
+            # → argument_reporter_string_number verwenden, NICHT data_variable
+            if name in self.current_params:
+                self._add(bid,"argument_reporter_string_number",parent_id,None,
+                    fields={"VALUE":[name,None]}); return bid
+            vid = self._var_id(name)
             self._add(bid,"data_variable",parent_id,None,
-                fields={"VARIABLE":[node["name"],vid]}); return bid
+                fields={"VARIABLE":[name,vid]}); return bid
         if t == "MotionVal":
             op = {"xPosition":"motion_xposition","yPosition":"motion_yposition",
                   "direction":"motion_direction"}[node["val"]]
@@ -1446,31 +1491,60 @@ class ScratchGenerator:
         raise ValueError(f"Unbekannter Ausdrucks-Typ: {t!r}")
 
     def gen_custom_def(self, cdef, x=0, y=0):
-        proto_id  = new_id(); param_ids = [new_id() for _ in cdef["params"]]
-        proccode  = cdef["name"] + "".join(f" %s" for _ in cdef["params"])
+        proto_id  = new_id()
+        param_ids = [new_id() for _ in cdef["params"]]
+        proccode  = cdef["name"] + "".join(" %s" for _ in cdef["params"])
+        warp      = str(self.custom_warp.get(cdef["name"], False)).lower()
         self.custom_procs[cdef["name"]] = proccode
+
         proto_inputs = {}
         for pid, pname in zip(param_ids, cdef["params"]):
             ab = new_id()
-            self.blocks[ab] = {"opcode":"argument_reporter_string_number","next":None,
-                "parent":proto_id,"inputs":{},"fields":{"VALUE":[pname,None]},
-                "shadow":True,"topLevel":False}
+            self.blocks[ab] = {
+                "opcode":   "argument_reporter_string_number",
+                "next":     None, "parent": proto_id,
+                "inputs":   {}, "fields": {"VALUE": [pname, None]},
+                "shadow":   True, "topLevel": False,
+            }
             proto_inputs[pid] = [1, ab]
-        self.blocks[proto_id] = {"opcode":"procedures_prototype","next":None,"parent":None,
-            "inputs":proto_inputs,"fields":{},"shadow":True,"topLevel":False,
-            "mutation":{"tagName":"mutation","children":[],"proccode":proccode,
-                "argumentids":json.dumps(param_ids),"argumentnames":json.dumps(cdef["params"]),
-                "argumentdefaults":json.dumps([""]*len(cdef["params"])),"warp":"false"}}
+
+        self.blocks[proto_id] = {
+            "opcode": "procedures_prototype", "next": None, "parent": None,
+            "inputs": proto_inputs, "fields": {}, "shadow": True, "topLevel": False,
+            "mutation": {
+                "tagName": "mutation", "children": [], "proccode": proccode,
+                "argumentids":       json.dumps(param_ids),
+                "argumentnames":     json.dumps(cdef["params"]),
+                "argumentdefaults":  json.dumps([""] * len(cdef["params"])),
+                "warp": warp,   # "true" = private/schnell, "false" = public/normal
+            },
+        }
+
         hat_id = new_id()
-        self._add(hat_id,"procedures_definition",None,None,
-            inputs={"custom_block":[1,proto_id]},top=True,x=x,y=y)
+        self._add(hat_id, "procedures_definition", None, None,
+                  inputs={"custom_block": [1, proto_id]}, top=True, x=x, y=y)
+
+        # ── Wichtig: Parameter für den Body-Scope setzen ──
+        # Während die Body-Blöcke generiert werden, muss gen_expr wissen
+        # welche Namen Parameter sind (→ argument_reporter statt data_variable).
+        old_params = self.current_params
+        self.current_params = {pname: pid for pname, pid in zip(cdef["params"], param_ids)}
         first = self._gen_seq(cdef["body"], hat_id)
+        self.current_params = old_params   # Scope verlassen
+        # ─────────────────────────────────────────────────
+
         self.blocks[hat_id]["next"] = first
         return hat_id
 
     def gen_target(self, target_node):
         self.blocks = {}; self.variables = {}; self.lists = {}
         self.broadcasts = {}; self.custom_procs = {}
+        self.current_params = {}
+        # private void → warp:true (läuft ohne Screen-Refresh, schneller)
+        self.custom_warp = {
+            cdef["name"]: (cdef.get("visibility") == "private")
+            for cdef in target_node.get("customDefs", [])
+        }
         for cdef in target_node.get("customDefs",[]):
             self.custom_procs[cdef["name"]] = cdef["name"]+"".join(" %s" for _ in cdef["params"])
         x_off = 0
@@ -1643,54 +1717,515 @@ class Validator:
 
 
 # ═══════════════════════════════════════════════════════
-#  6.  TURBOWARP LAUNCHER
+#  6.  APP LAUNCHER  (TurboWarp + Scratch Desktop)
 # ═══════════════════════════════════════════════════════
-def launch_turbowarp(sb3_path: str, replace: bool):
+
+# Beide Apps akzeptieren eine .sb3-Datei als CLI-Argument:
+#   TurboWarp Desktop:  turbowarp-desktop datei.sb3
+#   Scratch Desktop:    scratch-desktop datei.sb3
+#
+# Quellen:
+#   TurboWarp: Standard-Electron-Verhalten
+#   Scratch:   github.com/scratchfoundation/scratch-desktop
+#              src/main/index.js Zeile 471–492  (argv._[last] = Dateipfad)
+
+APP_PROFILES = {
+    # ── TurboWarp Desktop ─────────────────────────────
+    "turbowarp": {
+        "label": "TurboWarp",
+        "download": "https://turbowarp.org/desktop",
+        "Windows": {
+            "candidates": [
+                r"C:\Program Files\TurboWarp\TurboWarp.exe",
+                r"C:\Program Files (x86)\TurboWarp\TurboWarp.exe",
+                str(Path.home()/"AppData/Local/Programs/TurboWarp/TurboWarp.exe"),
+                str(Path.home()/"AppData/Local/Programs/turbowarp-desktop/TurboWarp.exe"),
+            ],
+            "kill": "TurboWarp.exe",
+            "launch": lambda exe, f: [exe, f],
+        },
+        "Darwin": {
+            "candidates": [
+                "/Applications/TurboWarp.app/Contents/MacOS/TurboWarp",
+                str(Path.home()/"Applications/TurboWarp.app/Contents/MacOS/TurboWarp"),
+            ],
+            "kill": "TurboWarp",
+            # macOS: open -n -a AppName --args file  öffnet neue Instanz
+            "launch": lambda exe, f: ["open", "-n", "-a", "TurboWarp", "--args", f],
+        },
+        "Linux": {
+            "candidates": [
+                "/usr/bin/turbowarp-desktop",
+                "/usr/local/bin/turbowarp-desktop",
+                str(Path.home()/".local/bin/turbowarp-desktop"),
+                "/snap/bin/turbowarp-desktop",
+                str(Path.home()/".local/share/applications/turbowarp-desktop"),
+            ],
+            "kill": "turbowarp-desktop",
+            "launch": lambda exe, f: [exe, f],
+        },
+    },
+    # ── Scratch Desktop ───────────────────────────────
+    # Scratch Desktop akzeptiert genau 1 Dateipfad als letztes CLI-Argument.
+    # Quelle: scratchfoundation/scratch-desktop src/main/index.js L478
+    "scratch": {
+        "label": "Scratch Desktop",
+        "download": "https://scratch.mit.edu/download",
+        "Windows": {
+            # Klassische .exe-Installation (scratch.mit.edu/download)
+            "candidates": [
+                r"C:\Program Files\Scratch Desktop\Scratch Desktop.exe",
+                r"C:\Program Files (x86)\Scratch Desktop\Scratch Desktop.exe",
+                str(Path.home()/"AppData/Local/Programs/scratch-desktop/Scratch Desktop.exe"),
+                str(Path.home()/"AppData/Local/Scratch Desktop/Scratch Desktop.exe"),
+            ],
+            "kill": "Scratch Desktop.exe",
+            "launch": lambda exe, f: [exe, f],
+        },
+        "Darwin": {
+            "candidates": [
+                "/Applications/Scratch Desktop.app/Contents/MacOS/Scratch Desktop",
+                str(Path.home()/"Applications/Scratch Desktop.app/Contents/MacOS/Scratch Desktop"),
+            ],
+            "kill": "Scratch Desktop",
+            "launch": lambda exe, f: ["open", "-n", "-a", "Scratch Desktop", "--args", f],
+        },
+        "Linux": {
+            "candidates": [
+                "/usr/bin/scratch-desktop",
+                "/usr/local/bin/scratch-desktop",
+                str(Path.home()/".local/bin/scratch-desktop"),
+                "/snap/bin/scratch-desktop",
+            ],
+            "kill": "scratch-desktop",
+            "launch": lambda exe, f: [exe, f],
+        },
+    },
+}
+
+
+# ═══════════════════════════════════════════════════════
+#  FENSTERPOSITION-VERWALTUNG
+# ═══════════════════════════════════════════════════════
+
+# Speicherpfad für Fensterposition (pro App getrennt)
+_WIN_STATE_FILE = Path.home() / ".scratch_transpiler_winstate.json"
+
+
+def _load_win_states() -> dict:
+    try:
+        return json.loads(_WIN_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_win_states(states: dict):
+    try:
+        _WIN_STATE_FILE.write_text(json.dumps(states, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _get_window_geometry_windows(process_name: str) -> dict | None:
+    """
+    Liest Position und Größe des Hauptfensters eines laufenden Prozesses auf Windows
+    via PowerShell + Win32-API (kein ctypes nötig).
+    Gibt {"x": int, "y": int, "w": int, "h": int, "maximized": bool} zurück.
+    """
+    script = f"""
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32 {{
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
+    [StructLayout(LayoutKind.Sequential)] public struct RECT {{ public int L,T,R,B; }}
+}}
+"@
+$procs = Get-Process -Name "{process_name.replace('.exe','')}" -ErrorAction SilentlyContinue
+foreach ($p in $procs) {{
+    if ($p.MainWindowHandle -ne 0) {{
+        $r = New-Object Win32+RECT
+        [Win32]::GetWindowRect($p.MainWindowHandle, [ref]$r) | Out-Null
+        $max = [Win32]::IsZoomed($p.MainWindowHandle)
+        Write-Output "$($r.L),$($r.T),$($r.R - $r.L),$($r.B - $r.T),$max"
+        break
+    }}
+}}
+"""
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True, text=True, timeout=6
+        )
+        line = result.stdout.strip()
+        if not line:
+            return None
+        parts = line.split(",")
+        if len(parts) < 5:
+            return None
+        x, y, w, h = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+        maximized = parts[4].strip().lower() == "true"
+        # Plausibilitäts-Check: Fenster muss mindestens 200x200 groß sein
+        if w < 200 or h < 200:
+            return None
+        return {"x": x, "y": y, "w": w, "h": h, "maximized": maximized}
+    except Exception:
+        return None
+
+
+def _get_window_geometry_macos(app_name: str) -> dict | None:
+    """
+    Liest Fensterposition auf macOS via AppleScript.
+    """
+    script = f"""
+tell application "System Events"
+    set p to first process whose displayed name contains "{app_name}"
+    set w to first window of p
+    set b to bounds of w
+    return (item 1 of b) & "," & (item 2 of b) & "," & ((item 3 of b) - (item 1 of b)) & "," & ((item 4 of b) - (item 2 of b))
+end tell
+"""
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=6
+        )
+        line = result.stdout.strip()
+        if not line:
+            return None
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 4:
+            return None
+        x, y, w, h = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+        if w < 200 or h < 200:
+            return None
+        return {"x": x, "y": y, "w": w, "h": h, "maximized": False}
+    except Exception:
+        return None
+
+
+def _get_window_geometry_linux(process_name: str) -> dict | None:
+    """
+    Liest Fensterposition auf Linux via xdotool (muss installiert sein).
+    """
+    try:
+        # Fenster-ID via Prozessname finden
+        find = subprocess.run(
+            ["xdotool", "search", "--name", process_name],
+            capture_output=True, text=True, timeout=4
+        )
+        wids = find.stdout.strip().split()
+        if not wids:
+            # Alternativ: via Prozessklasse suchen
+            find2 = subprocess.run(
+                ["xdotool", "search", "--class", process_name],
+                capture_output=True, text=True, timeout=4
+            )
+            wids = find2.stdout.strip().split()
+        if not wids:
+            return None
+        wid = wids[0]
+        # Geometrie auslesen
+        geo = subprocess.run(
+            ["xdotool", "getwindowgeometry", "--shell", wid],
+            capture_output=True, text=True, timeout=4
+        )
+        vals = {}
+        for line in geo.stdout.strip().split("\n"):
+            if "=" in line:
+                k, v = line.split("=", 1)
+                vals[k.strip()] = v.strip()
+        x = int(vals.get("X", 0))
+        y = int(vals.get("Y", 0))
+        w = int(vals.get("WIDTH", 0))
+        h = int(vals.get("HEIGHT", 0))
+        if w < 200 or h < 200:
+            return None
+        return {"x": x, "y": y, "w": w, "h": h, "maximized": False}
+    except Exception:
+        return None
+
+
+def save_window_state(app: str, process_name: str):
+    """
+    Liest die aktuelle Fenstergeometrie des laufenden Prozesses
+    und speichert sie in der State-Datei.
+    """
+    system = platform.system()
+    geo = None
+    if system == "Windows":
+        geo = _get_window_geometry_windows(process_name)
+    elif system == "Darwin":
+        label = APP_PROFILES[app]["label"]
+        geo = _get_window_geometry_macos(label)
+    else:
+        geo = _get_window_geometry_linux(process_name)
+
+    if geo:
+        states = _load_win_states()
+        states[app] = geo
+        _save_win_states(states)
+        if geo.get("maximized"):
+            pos = "maximiert"
+        else:
+            pos = f"{geo['x']},{geo['y']}  {geo['w']}×{geo['h']}"
+        print(f"  💾  Fensterposition gespeichert ({pos})")
+    else:
+        print(f"  ℹ  Fensterposition konnte nicht ausgelesen werden")
+
+
+def restore_window_state(app: str, process_name: str, pid: int | None = None):
+    """
+    Wartet bis das neue Fenster erscheint und stellt dann
+    Position und Größe aus der State-Datei wieder her.
+    Läuft in einem Hintergrund-Thread damit der Hauptprozess nicht blockiert.
+    """
+    import threading
+
+    states = _load_win_states()
+    geo = states.get(app)
+    if not geo:
+        return   # Noch kein gespeicherter Zustand
+
+    def _restore():
+        system = platform.system()
+        # Kurz warten bis das Fenster geöffnet ist
+        time.sleep(1.8)
+
+        if system == "Windows":
+            _restore_windows(process_name, geo)
+        elif system == "Darwin":
+            label = APP_PROFILES[app]["label"]
+            _restore_macos(label, geo)
+        else:
+            _restore_linux(process_name, geo)
+
+    t = threading.Thread(target=_restore, daemon=True)
+    t.start()
+
+
+def _restore_windows(process_name: str, geo: dict):
+    if geo.get("maximized"):
+        script = f"""
+$p = Get-Process -Name "{process_name.replace('.exe','')}" -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($p -and $p.MainWindowHandle -ne 0) {{
+    Add-Type -Name W -Namespace W -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);'
+    [W.W]::ShowWindow($p.MainWindowHandle, 3)
+}}
+"""
+    else:
+        x, y, w, h = geo["x"], geo["y"], geo["w"], geo["h"]
+        script = f"""
+Add-Type @"
+using System; using System.Runtime.InteropServices;
+public class WM {{
+    [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr h, int x, int y, int w, int h, bool r);
+}}
+"@
+$p = Get-Process -Name "{process_name.replace('.exe','')}" -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($p -and $p.MainWindowHandle -ne 0) {{
+    [WM]::MoveWindow($p.MainWindowHandle, {x}, {y}, {w}, {h}, $true)
+}}
+"""
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                       capture_output=True, timeout=6)
+    except Exception:
+        pass
+
+
+def _restore_macos(app_name: str, geo: dict):
+    x, y, w, h = geo["x"], geo["y"], geo["w"], geo["h"]
+    script = f"""
+tell application "System Events"
+    set p to first process whose displayed name contains "{app_name}"
+    set w to first window of p
+    set bounds of w to {{{x}, {y}, {x+w}, {y+h}}}
+end tell
+"""
+    try:
+        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=6)
+    except Exception:
+        pass
+
+
+def _restore_linux(process_name: str, geo: dict):
+    x, y, w, h = geo["x"], geo["y"], geo["w"], geo["h"]
+    try:
+        find = subprocess.run(
+            ["xdotool", "search", "--name", process_name],
+            capture_output=True, text=True, timeout=4
+        )
+        wids = find.stdout.strip().split()
+        if not wids:
+            return
+        wid = wids[0]
+        subprocess.run(["xdotool", "windowmove", wid, str(x), str(y)],
+                       capture_output=True, timeout=4)
+        subprocess.run(["xdotool", "windowsize", wid, str(w), str(h)],
+                       capture_output=True, timeout=4)
+    except Exception:
+        pass
+
+
+def _find_scratch_store_aumid() -> str | None:
+    """
+    Sucht die AUMID (Application User Model ID) der Microsoft-Store-Version
+    von Scratch via PowerShell Get-AppxPackage.
+    Gibt z.B. 'ScratchFoundation.Scratch3_abc123xyz!App' zurück, oder None.
+    """
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-AppxPackage *Scratch* | Select-Object -ExpandProperty PackageFamilyName"],
+            capture_output=True, text=True, timeout=8
+        )
+        family = result.stdout.strip()
+        if family:
+            # PackageFamilyName  →  AUMID = FamilyName!App
+            return f"{family}!App"
+    except Exception:
+        pass
+    return None
+
+
+def _find_scratch_store_exe() -> str | None:
+    """
+    Sucht die .exe der Store-Version von Scratch im WindowsApps-Ordner.
+    Dieser Ordner ist normalerweise nur mit Admin-Rechten lesbar —
+    daher nur als Fallback, Store-Start via shell: ist zuverlässiger.
+    """
+    import glob
+    patterns = [
+        r"C:\Program Files\WindowsApps\ScratchFoundation.Scratch3_*\Scratch Desktop.exe",
+        r"C:\Program Files\WindowsApps\ScratchFoundation.Scratch3_*\Scratch*.exe",
+    ]
+    for pat in patterns:
+        hits = glob.glob(pat)
+        if hits:
+            return hits[0]
+    return None
+
+
+def launch_app(sb3_path: str, app: str, replace: bool):
+    """
+    Startet TurboWarp Desktop oder Scratch Desktop mit der angegebenen .sb3-Datei.
+
+    Für Scratch auf Windows werden drei Wege versucht (in dieser Reihenfolge):
+      1. Klassische .exe-Installation (Program Files / AppData)
+      2. Microsoft Store-Version via PowerShell Start-Process shell:AppsFolder
+      3. Direkte .exe im WindowsApps-Ordner (benötigt ggf. Admin)
+
+    app:     "turbowarp" | "scratch"
+    replace: True  → laufende Instanzen beenden, dann neu starten
+             False → neue Instanz zusätzlich starten
+    """
     sb3_abs = str(Path(sb3_path).resolve())
     system  = platform.system()
-    if system == "Windows":
-        candidates = [
-            r"C:\Program Files\TurboWarp\TurboWarp.exe",
-            r"C:\Program Files (x86)\TurboWarp\TurboWarp.exe",
-            str(Path.home()/"AppData/Local/Programs/TurboWarp/TurboWarp.exe"),
-            str(Path.home()/"AppData/Local/Programs/turbowarp-desktop/TurboWarp.exe"),
-        ]
-        kill_name = "TurboWarp.exe"
-    elif system == "Darwin":
-        candidates = [
-            "/Applications/TurboWarp.app/Contents/MacOS/TurboWarp",
-            str(Path.home()/"Applications/TurboWarp.app/Contents/MacOS/TurboWarp"),
-        ]
-        kill_name = "TurboWarp"
-    else:
-        candidates = [
-            "/usr/bin/turbowarp-desktop","/usr/local/bin/turbowarp-desktop",
-            str(Path.home()/".local/bin/turbowarp-desktop"),"/snap/bin/turbowarp-desktop",
-        ]
-        kill_name = "turbowarp-desktop"
+    sys_key = {"Windows":"Windows","Darwin":"Darwin"}.get(system, "Linux")
 
-    tw_exe = next((c for c in candidates if Path(c).exists()), None)
-    if tw_exe is None:
-        print("  ⚠  TurboWarp Desktop nicht gefunden.")
-        print("     https://turbowarp.org/desktop")
-        print(f"     Datei manuell öffnen: {sb3_abs}"); return
+    profile     = APP_PROFILES[app]
+    sys_profile = profile[sys_key]
+    label       = profile["label"]
 
+    # ── Fensterposition speichern, dann beenden ───────
     if replace:
-        print("  ⏹  Beende laufende TurboWarp-Instanzen...")
+        kill = sys_profile["kill"]
+        # Zuerst Position auslesen (solange das Fenster noch offen ist)
+        save_window_state(app, kill)
+        print(f"  ⏹  Beende laufende {label}-Instanzen...")
         if system == "Windows":
-            subprocess.run(["taskkill","/F","/IM",kill_name], capture_output=True)
+            subprocess.run(["taskkill", "/F", "/IM", kill], capture_output=True)
         else:
-            subprocess.run(["pkill","-f",kill_name], capture_output=True)
+            subprocess.run(["pkill", "-f", kill], capture_output=True)
         time.sleep(0.8)
 
     mode = "Ersetze" if replace else "Starte neue"
-    print(f"  ▶  {mode} TurboWarp-Instanz: {Path(sb3_abs).name}")
-    if system == "Windows":
-        subprocess.Popen([tw_exe, sb3_abs])
-    elif system == "Darwin":
-        subprocess.Popen(["open","-n","-a","TurboWarp","--args",sb3_abs])
-    else:
-        subprocess.Popen([tw_exe, sb3_abs])
+
+    # ── Windows: klassische .exe suchen ──────────────
+    if system == "Windows" and app == "scratch":
+        exe = next((c for c in sys_profile["candidates"] if Path(c).exists()), None)
+
+        if exe:
+            # Klassische Installation gefunden — direkt starten
+            print(f"  ▶  {mode} {label}-Instanz: {Path(sb3_abs).name}")
+            print(f"     (klassische Installation: {exe})")
+            subprocess.Popen([exe, sb3_abs])
+            if replace:
+                restore_window_state(app, sys_profile["kill"])
+            return
+
+        # ── Microsoft Store-Version ───────────────────
+        # Store-Apps können KEINEN Dateipfad direkt als Argument empfangen,
+        # weil Windows die App in einer AppContainer-Sandbox startet.
+        # Lösung: Datei zuerst öffnen, dann die App mit dem Protokoll-Handler starten.
+        # Oder: via PowerShell Start-Process mit shell:AppsFolder
+        print(f"  ℹ  Klassische Scratch-Installation nicht gefunden.")
+        print(f"     Suche Microsoft Store-Version (Scratch 3)...")
+
+        aumid = _find_scratch_store_aumid()
+        if aumid:
+            print(f"  ✓  Store-Version gefunden: {aumid}")
+            print(f"  ▶  {mode} {label}-Instanz: {Path(sb3_abs).name}")
+            print()
+            print("  ⚠  HINWEIS: Die Microsoft Store-Version von Scratch kann")
+            print("     .sb3-Dateien nicht direkt per CLI öffnen (Sandbox-Einschränkung).")
+            print("     Die App wird geöffnet — lade die Datei manuell über")
+            print("     Datei → Vom Computer laden:")
+            print(f"     {sb3_abs}")
+            print()
+            # App starten (ohne Dateiargument — Store-Sandbox erlaubt das nicht)
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-Command",
+                 f'Start-Process "shell:AppsFolder\\{aumid}"'],
+                capture_output=True
+            )
+            # Dateipfad in die Zwischenablage kopieren damit der User ihn leicht einfügen kann
+            try:
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     f'Set-Clipboard -Value "{sb3_abs}"'],
+                    capture_output=True, timeout=3
+                )
+                print("  📋  Dateipfad wurde in die Zwischenablage kopiert.")
+            except Exception:
+                pass
+            return
+
+        # ── Letzter Versuch: WindowsApps-Ordner ──────
+        store_exe = _find_scratch_store_exe()
+        if store_exe:
+            print(f"  ✓  Store-Exe gefunden: {store_exe}")
+            print(f"  ▶  {mode} {label}: {Path(sb3_abs).name}")
+            try:
+                subprocess.Popen([store_exe, sb3_abs])
+            except PermissionError:
+                print("  ✗  Zugriff verweigert (WindowsApps benötigt Admin-Rechte).")
+                print("     Starte ohne Dateiargument...")
+                subprocess.Popen([store_exe])
+            return
+
+        # ── Nichts gefunden ───────────────────────────
+        print(f"  ✗  Scratch Desktop nicht gefunden.")
+        print(f"     Store-Version (Scratch 3):  apps.microsoft.com/detail/9pfgj25j6x3")
+        print(f"     Klassische Version:          {profile['download']}")
+        print(f"     Datei manuell öffnen: {sb3_abs}")
+        return
+
+    # ── Alle anderen Systeme / TurboWarp ──────────────
+    exe = next((c for c in sys_profile["candidates"] if Path(c).exists()), None)
+    if exe is None:
+        print(f"  ⚠  {label} nicht gefunden.")
+        print(f"     Download: {profile['download']}")
+        print(f"     Datei manuell öffnen: {sb3_abs}")
+        return
+
+    print(f"  ▶  {mode} {label}-Instanz: {Path(sb3_abs).name}")
+    cmd = sys_profile["launch"](exe, sb3_abs)
+    subprocess.Popen(cmd)
+    if replace:
+        restore_window_state(app, sys_profile["kill"])
 
 
 # ═══════════════════════════════════════════════════════
@@ -1742,10 +2277,10 @@ def compile_once(source: str, base_dir: Path, outfile: str,
 # ═══════════════════════════════════════════════════════
 #  8.  WATCH-MODUS
 # ═══════════════════════════════════════════════════════
-def watch_mode(src_path: Path, outfile: str, tw_mode: str | None):
+def watch_mode(src_path: Path, outfile: str, app_mode: tuple | None):
     """
     Beobachtet die Quelldatei und kompiliert bei jeder Änderung neu.
-    tw_mode: None | "new" | "replace"
+    app_mode: None | ("turbowarp"|"scratch", "new"|"replace")
     """
     print(f"👁  Watch-Modus aktiv – beobachte: {src_path}")
     print("   Ctrl+C zum Beenden\n")
@@ -1773,9 +2308,11 @@ def watch_mode(src_path: Path, outfile: str, tw_mode: str | None):
 
             success = compile_once(source, base_dir, outfile, asset_mgr)
 
-            if success and tw_mode:
-                print("── [5] TurboWarp ───────────────────────────")
-                launch_turbowarp(outfile, replace=(tw_mode=="replace"))
+            if success and app_mode:
+                app, mode = app_mode
+                label = APP_PROFILES[app]["label"]
+                print(f"── [5] {label} ───────────────────────────")
+                launch_app(outfile, app=app, replace=(mode=="replace"))
 
             print("\n   Warte auf Änderungen...")
 
@@ -1787,34 +2324,48 @@ def watch_mode(src_path: Path, outfile: str, tw_mode: str | None):
 # ═══════════════════════════════════════════════════════
 def print_help():
     print("""
-scratch_transpiler.py  v4.0
+scratch_transpiler.py  v4.1
 ────────────────────────────────────────────────────────
 VERWENDUNG:
   python scratch_transpiler.py <eingabe.java> [Optionen]
 
 OPTIONEN:
-  --out <datei.sb3>       Ausgabedatei (Standard: output.sb3)
-  --watch                 Watch-Modus: kompiliert bei Dateiänderung neu
-  --turbowarp-new         Startet TurboWarp Desktop nach Kompilierung
-                          (bestehende Instanzen bleiben offen)
-  --turbowarp-replace     Beendet laufende TurboWarp-Instanz und startet neu
-  --help                  Diese Hilfe anzeigen
+  --out <datei.sb3>         Ausgabedatei (Standard: output.sb3)
+  --watch                   Watch-Modus: kompiliert bei Dateiänderung neu
+
+  TurboWarp Desktop:
+  --turbowarp-new           Startet TurboWarp nach Kompilierung
+                            (bestehende Instanzen bleiben offen)
+  --turbowarp-replace       Beendet laufende TurboWarp-Instanz, startet neu
+
+  Scratch Desktop:
+  --scratch-new             Startet Scratch Desktop nach Kompilierung
+                            (bestehende Instanzen bleiben offen)
+  --scratch-replace         Beendet laufende Scratch-Instanz, startet neu
+
+  --help                    Diese Hilfe anzeigen
+
+HINWEIS: --turbowarp-* und --scratch-* schließen sich gegenseitig aus.
+         Im Watch-Modus wird die App bei jeder Änderung neu gestartet.
 
 BEISPIELE:
   python scratch_transpiler.py spiel.java
-  python scratch_transpiler.py spiel.java --out spiel.sb3 --watch --turbowarp-replace
-  python scratch_transpiler.py spiel.java --turbowarp-new
+  python scratch_transpiler.py spiel.java --out spiel.sb3
+  python scratch_transpiler.py spiel.java --watch --turbowarp-replace
+  python scratch_transpiler.py spiel.java --watch --scratch-replace
+  python scratch_transpiler.py spiel.java --scratch-new
 
 Alle Infos zur Syntax: siehe README.md
 """)
 
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
-    args    = sys.argv[1:]
-    infile  = None
-    outfile = "output.sb3"
-    tw_mode = None
-    watch   = False
+    args     = sys.argv[1:]
+    infile   = None
+    outfile  = "output.sb3"
+    app_mode = None   # None | ("turbowarp"|"scratch", "new"|"replace")
+    watch    = False
 
     i = 0
     while i < len(args):
@@ -1822,9 +2373,17 @@ def main():
         if a == "--out" and i+1 < len(args):
             outfile = args[i+1]; i += 2
         elif a == "--turbowarp-new":
-            tw_mode = "new"; i += 1
+            if app_mode: print("⚠  Mehrere App-Flags angegeben – letztes gewinnt.")
+            app_mode = ("turbowarp", "new"); i += 1
         elif a == "--turbowarp-replace":
-            tw_mode = "replace"; i += 1
+            if app_mode: print("⚠  Mehrere App-Flags angegeben – letztes gewinnt.")
+            app_mode = ("turbowarp", "replace"); i += 1
+        elif a == "--scratch-new":
+            if app_mode: print("⚠  Mehrere App-Flags angegeben – letztes gewinnt.")
+            app_mode = ("scratch", "new"); i += 1
+        elif a == "--scratch-replace":
+            if app_mode: print("⚠  Mehrere App-Flags angegeben – letztes gewinnt.")
+            app_mode = ("scratch", "replace"); i += 1
         elif a == "--watch":
             watch = True; i += 1
         elif a in ("--help", "-h"):
@@ -1843,7 +2402,7 @@ def main():
     # Watch-Modus
     if watch:
         try:
-            watch_mode(src_path, outfile, tw_mode)
+            watch_mode(src_path, outfile, app_mode)
         except KeyboardInterrupt:
             print("\n👋  Watch-Modus beendet.")
         return
@@ -1858,13 +2417,15 @@ def main():
     if not success:
         sys.exit(1)
 
-    if tw_mode:
-        print("── [5] TurboWarp ───────────────────────────")
-        launch_turbowarp(outfile, replace=(tw_mode=="replace"))
+    if app_mode:
+        app, mode = app_mode
+        label = APP_PROFILES[app]["label"]
+        print(f"── [5] {label} ───────────────────────────")
+        launch_app(outfile, app=app, replace=(mode=="replace"))
 
     print("\n── Fertig! ─────────────────────────────────")
-    if not tw_mode:
-        print(f"   Öffne {outfile} in TurboWarp oder Scratch.")
+    if not app_mode:
+        print(f"   Öffne {outfile} in TurboWarp oder Scratch Desktop.")
 
 
 if __name__ == "__main__":
