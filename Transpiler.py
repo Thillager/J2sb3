@@ -1,5 +1,5 @@
 """
-scratch_transpiler.py  v4.0
+Transpiler.py  v5.0
 ════════════════════════════
 Java-ähnliche Syntax → Scratch 3 / TurboWarp .sb3
 
@@ -268,7 +268,7 @@ KEYWORDS = {
     "penDown","penUp","setPenColor","changePenColor",
     "setPenSize","changePenSize","stampPen","erasePen",
     "broadcast","broadcastAndWait",
-    "define","void","public","private",
+    "define","void","public","private","shown","hidden",
     "addCostume","addBackdrop","addSound",
     "random","abs","floor","ceil","sqrt",
     "sin","cos","tan","asin","acos","atan","ln","log","round",
@@ -444,33 +444,66 @@ class Parser:
                 if self.peek()[1] == ",": self.consume("COMMA"); path = self.consume("STRING").strip('"')
                 self.consume("RPAREN"); self.expect_semi()
                 sounds.append({"name": sname, "path": path})
-            elif v in ("public", "private"):
-                # Sichtbarkeits-Modifier: public/private var  oder  public/private void
-                visibility = self.consume()   # consume 'public' oder 'private'
+            elif v in ("public", "private", "shown", "hidden", "var", "void", "define"):
+                # ── Modifier-Parsing ──────────────────────────────────────
+                # Erlaubte Kombinationen (Reihenfolge egal):
+                #   var / void / define
+                #   public / private          (Scope: alle Sprites / nur dieser)
+                #   shown  / hidden           (Monitor anzeigen / verstecken)
+                #
+                # Beispiele:
+                #   public shown var punkte = 0;
+                #   private hidden var intern = 0;
+                #   public void zeichne(x) { }
+                #   private void berechne(x) { }   ← warp (kein Screen-Refresh)
+                #   hidden void hilfsBlock(x) { }   ← ohne Monitor-Anzeige
+                #   var x = 0;                      ← implizit public shown
+
+                scope   = None   # "public" | "private"
+                display = None   # "shown"  | "hidden"
+
+                # Alle Modifier konsumieren bis wir bei var/void/define sind
+                while self.peek()[1] in ("public","private","shown","hidden"):
+                    mod = self.consume()
+                    if mod in ("public","private"):
+                        if scope is not None:
+                            raise SyntaxError(f"Zeile {self.current_line()}: Doppelter Scope-Modifier: '{mod}'")
+                        scope = mod
+                    else:
+                        if display is not None:
+                            raise SyntaxError(f"Zeile {self.current_line()}: Doppelter Display-Modifier: '{mod}'")
+                        display = mod
+
+                # Defaults
                 nv = self.peek()[1]
                 if nv == "var":
+                    scope   = scope   or "public"
+                    display = display or "shown"
                     decl = self.parse_var_decl()
-                    decl["visibility"] = visibility
+                    decl["scope"]   = scope    # "public" = in Stage, "private" = im Sprite
+                    decl["display"] = display  # "shown" = Monitor an, "hidden" = aus
                     scripts.append({"event": {"type": "EventFlagClicked"}, "body": [decl]})
                 elif nv in ("void", "define"):
+                    scope   = scope   or "public"
+                    # hidden void → warp (kein Screen-Refresh)
+                    # private void → warp (kein Screen-Refresh)
+                    # display spielt bei Methoden keine Rolle (kein Monitor)
+                    warp = (scope == "private") or (display == "hidden")
                     cd = self.parse_custom_def()
-                    cd["visibility"] = visibility
+                    cd["scope"] = scope
+                    cd["warp"]  = warp
                     custom_defs.append(cd)
-                    self.custom_blocks[cd["name"]] = cd["params"]
+                    # custom_blocks speichert nur Namen (für Aufruf-Erkennung)
+                    raw = cd["params"]
+                    self.custom_blocks[cd["name"]] = (
+                        [p[0] for p in raw] if raw and not isinstance(raw[0], str) else raw
+                    )
                 else:
+                    mods = " ".join(filter(None, [scope, display]))
                     raise SyntaxError(
-                        f"Zeile {self.current_line()}: Nach '{visibility}' erwartet "
+                        f"Zeile {self.current_line()}: Nach '{mods}' erwartet "
                         f"'var', 'void' oder 'define', gefunden '{nv}'"
                     )
-            elif v == "var":
-                decl = self.parse_var_decl()
-                decl.setdefault("visibility", "public")
-                scripts.append({"event": {"type": "EventFlagClicked"}, "body": [decl]})
-            elif v in ("define", "void"):
-                cd = self.parse_custom_def()
-                cd.setdefault("visibility", "public")
-                custom_defs.append(cd)
-                self.custom_blocks[cd["name"]] = cd["params"]
             elif v in ("onFlagClicked","onKeyPressed","onSpriteClicked",
                        "onBackdropChanged","onBroadcastReceived"):
                 event, body = self.parse_script()
@@ -515,17 +548,53 @@ class Parser:
     def parse_custom_def(self):
         """
         Akzeptiert beide Syntaxformen für eigene Blöcke:
-          define blockName(param1, param2) { … }   ← bisherige Syntax
-          void   blockName(param1, param2) { … }   ← Java-style
+          define blockName(param1, param2) { … }
+          void   blockName(param1, param2) { … }
+
+        Parameter können optional mit einem Typ annotiert werden:
+          void foo(number x, string y, z) { … }
+              → x = %n (Zahl), y = %s (String), z = %s (Standard)
+
+        Typen:
+          number / int / float  → %n  (Scratch behandelt Wert als Zahl)
+          string / str          → %s  (Scratch behandelt Wert als String)
+          boolean / bool        → %b  (Scratch: sechseckiger Boolean-Slot)
+          kein Typ              → %s  (Standard = String)
+
+        WICHTIG: Wenn ein Parameter in einem Zahlen-Slot landet (z.B. bei
+        move(), wait(), sayFor() als Sekunden), MUSS er als 'number' deklariert
+        werden — sonst behandelt Scratch ihn als String und Blöcke wie
+        sayFor("Text", secs) zeigen "0 Sekunden" statt dem echten Wert!
+
+        Falsch:  void foo(secs)         { sayFor("Hi", secs); }
+        Richtig: void foo(number secs)  { sayFor("Hi", secs); }
         """
         self.consume()   # consume 'define' oder 'void'
         name = self.consume("IDENT")
-        self.consume("LPAREN"); params = []
+        self.consume("LPAREN")
+        params      = []   # [(param_name, type_code)]  type_code = "%s"|"%n"|"%b"
+        TYPE_MAP = {
+            "number": "%s", "int": "%s", "float": "%s",
+            "string": "%s", "str": "%s",
+            "boolean": "%b", "bool": "%b",
+        }
         while self.peek()[1] != ")":
-            params.append(self.consume("IDENT"))
+            # Typ-Annotation nur erkennen wenn ZWEI Tokens vor , oder ) stehen:
+            # "number x"  → Typ=number, Name=x
+            # "x"         → kein Typ, Name=x
+            pk0, pv0, _ = self.peek(0)
+            pk1, pv1, _ = self.peek(1)
+            if pv0 in TYPE_MAP and pk1 == "IDENT":
+                # Nächstes Token ist Typ, übernächstes ist Parametername
+                self.consume()           # Typ konsumieren
+                type_code = TYPE_MAP[pv0]
+            else:
+                type_code = "%s"
+            pname = self.consume("IDENT")
+            params.append((pname, type_code))
             if self.peek()[1] == ",": self.consume("COMMA")
         self.consume("RPAREN")
-        self.custom_blocks[name] = params
+        self.custom_blocks[name] = [p[0] for p in params]
         return {"type": "CustomDef", "name": name, "params": params, "body": self.parse_block()}
 
     # ── Statements ────────────────────────────────────
@@ -987,11 +1056,13 @@ class ScratchGenerator:
         self.lists:           dict = {}
         self.broadcasts:      dict = {}
         self.custom_procs:    dict = {}   # name → proccode
+        self.custom_arg_ids:  dict = {}   # name → argument IDs shared by definition and calls
         self.custom_warp:     dict = {}   # name → bool (warp/private)
         # Aktuell aktive Parameter eines Custom Blocks:
         # name → argument_reporter Block-ID
         # Wird in gen_custom_def gesetzt und in gen_expr genutzt.
         self.current_params:  dict = {}
+        self._var_scope:      dict = {}   # var_name → "public"|"private"
 
     def _add(self, bid, opcode, parent, nxt,
              inputs=None, fields=None, top=False, x=0, y=0, mutation=None):
@@ -1007,18 +1078,29 @@ class ScratchGenerator:
             v = node["value"]
             return [4, str(int(v) if isinstance(v, float) and v.is_integer() else v)]
         if node["type"] == "Str":  return [10, node["value"]]
-        if node["type"] == "Bool": return [10, "true" if node["value"] else "false"]
+        # Scratch hat keinen primitiven Boolean-Shadow wie [10, "true"].
+        # true/false werden deshalb als echte Boolean-Reporter erzeugt.
         return None
 
     def _input(self, node, parent_id, slot=1):
+        """Create a Scratch input.
+
+        Primitive literals keep the caller's slot type (usually 1).
+        A generated reporter block must be connected with input type 2:
+        [2, blockId].  [3, null, blockId] is NOT a valid Scratch input.
+        """
         iv = self._iv(node)
-        if iv: return [slot, iv]
-        return [slot, self.gen_expr(node, parent_id)]
+        if iv:
+            return [slot, iv]
+        child_id = self.gen_expr(node, parent_id)
+        return [2, child_id]
 
     def _bool_input(self, node, parent_id):
         iv = self._iv(node)
-        if iv: return [2, iv]
-        return [2, self.gen_expr(node, parent_id)]
+        if iv:
+            return [2, iv]
+        child_id = self.gen_expr(node, parent_id)
+        return [2, child_id]
 
     def _var_id(self, n):
         if n not in self.variables: self.variables[n] = new_id()
@@ -1031,6 +1113,15 @@ class ScratchGenerator:
     def _broadcast_id(self, n):
         if n not in self.broadcasts: self.broadcasts[n] = new_id()
         return self.broadcasts[n]
+
+    def _num_input(self, node, parent_id):
+        """Input for numeric Scratch slots.
+
+        Scratch custom-block numeric/text parameters use %s and are represented
+        by argument_reporter_string_number.  The reporter is connected directly
+        to the numeric input; no operator_add wrapper is needed.
+        """
+        return self._input(node, parent_id)
 
     def _menu_shadow(self, opcode, field_name, value, parent_id):
         mid = new_id()
@@ -1112,17 +1203,26 @@ class ScratchGenerator:
 
         # Variablen
         if t == "VarDecl":
-            inp = self._input(node["value"], bid) if node["value"] else [1,[10,""]]
+            inp      = self._input(node["value"], bid) if node["value"] else [1,[10,""]]
             var_name = node["name"]
-            # private var → wird mit hideVariable-Block direkt nach der Deklaration versteckt
+            scope    = node.get("scope",   "public")   # "public" | "private"
+            display  = node.get("display", "shown")    # "shown"  | "hidden"
+
+            # Scope wird in build_project ausgewertet (public→Stage, private→Sprite)
+            # Hier nur: set + optional hide
+            self._var_scope[var_name] = scope   # für build_project merken
+
             self._add(bid, "data_setvariableto", parent_id, next_id,
-                inputs={"VALUE": inp}, fields={"VARIABLE": [var_name, self._var_id(var_name)]})
-            if node.get("visibility") == "private":
-                # Erzeuge einen hideVariable-Block direkt dahinter
+                inputs={"VALUE": inp},
+                fields={"VARIABLE": [var_name, self._var_id(var_name)]})
+
+            # hidden → direkt danach einen hideVariable-Block einfügen
+            if display == "hidden":
                 hide_id = new_id()
                 self._add(hide_id, "data_hidevariable", bid, next_id,
                     fields={"VARIABLE": [var_name, self._var_id(var_name)]})
                 self.blocks[bid]["next"] = hide_id
+
             return bid
         if t == "VarSet":
             self._add(bid, "data_setvariableto", parent_id, next_id,
@@ -1219,39 +1319,39 @@ class ScratchGenerator:
 
         # Motion
         if t == "Move":
-            self._add(bid,"motion_movesteps",parent_id,next_id,inputs={"STEPS":self._input(node["value"],bid)}); return bid
+            self._add(bid,"motion_movesteps",parent_id,next_id,inputs={"STEPS":self._num_input(node["value"],bid)}); return bid
         if t == "TurnLeft":
-            self._add(bid,"motion_turnleft",parent_id,next_id,inputs={"DEGREES":self._input(node["value"],bid)}); return bid
+            self._add(bid,"motion_turnleft",parent_id,next_id,inputs={"DEGREES":self._num_input(node["value"],bid)}); return bid
         if t == "TurnRight":
-            self._add(bid,"motion_turnright",parent_id,next_id,inputs={"DEGREES":self._input(node["value"],bid)}); return bid
+            self._add(bid,"motion_turnright",parent_id,next_id,inputs={"DEGREES":self._num_input(node["value"],bid)}); return bid
         if t == "GoToXY":
             self._add(bid,"motion_gotoxy",parent_id,next_id,
-                inputs={"X":self._input(node["x"],bid),"Y":self._input(node["y"],bid)}); return bid
+                inputs={"X":self._num_input(node["x"],bid),"Y":self._num_input(node["y"],bid)}); return bid
         if t == "GoToSprite":
             mid = self._menu_shadow("motion_goto_menu","TO",node["value"],bid)
             self._add(bid,"motion_goto",parent_id,next_id,inputs={"TO":[1,mid]}); return bid
         if t == "Glide":
             self._add(bid,"motion_glidesecstoxy",parent_id,next_id,
-                inputs={"SECS":self._input(node["secs"],bid),
-                        "X":self._input(node["x"],bid),"Y":self._input(node["y"],bid)}); return bid
+                inputs={"SECS":self._num_input(node["secs"],bid),
+                        "X":self._num_input(node["x"],bid),"Y":self._num_input(node["y"],bid)}); return bid
         if t == "GlideToSprite":
             mid = self._menu_shadow("motion_glideto_menu","TO",node["target"],bid)
             self._add(bid,"motion_glideto",parent_id,next_id,
-                inputs={"SECS":self._input(node["secs"],bid),"TO":[1,mid]}); return bid
+                inputs={"SECS":self._num_input(node["secs"],bid),"TO":[1,mid]}); return bid
         if t == "PointDir":
             self._add(bid,"motion_pointindirection",parent_id,next_id,
-                inputs={"DIRECTION":self._input(node["value"],bid)}); return bid
+                inputs={"DIRECTION":self._num_input(node["value"],bid)}); return bid
         if t == "PointTowards":
             mid = self._menu_shadow("motion_pointtowards_menu","TOWARDS",node["value"],bid)
             self._add(bid,"motion_pointtowards",parent_id,next_id,inputs={"TOWARDS":[1,mid]}); return bid
         if t == "SetX":
-            self._add(bid,"motion_setx",parent_id,next_id,inputs={"X":self._input(node["value"],bid)}); return bid
+            self._add(bid,"motion_setx",parent_id,next_id,inputs={"X":self._num_input(node["value"],bid)}); return bid
         if t == "SetY":
-            self._add(bid,"motion_sety",parent_id,next_id,inputs={"Y":self._input(node["value"],bid)}); return bid
+            self._add(bid,"motion_sety",parent_id,next_id,inputs={"Y":self._num_input(node["value"],bid)}); return bid
         if t == "ChangeX":
-            self._add(bid,"motion_changexby",parent_id,next_id,inputs={"DX":self._input(node["value"],bid)}); return bid
+            self._add(bid,"motion_changexby",parent_id,next_id,inputs={"DX":self._num_input(node["value"],bid)}); return bid
         if t == "ChangeY":
-            self._add(bid,"motion_changeyby",parent_id,next_id,inputs={"DY":self._input(node["value"],bid)}); return bid
+            self._add(bid,"motion_changeyby",parent_id,next_id,inputs={"DY":self._num_input(node["value"],bid)}); return bid
         if t == "BounceOnEdge":
             self._add(bid,"motion_ifonedgebounce",parent_id,next_id); return bid
         if t == "SetRotationStyle":
@@ -1263,12 +1363,12 @@ class ScratchGenerator:
             self._add(bid,"looks_say",parent_id,next_id,inputs={"MESSAGE":self._input(node["text"],bid)}); return bid
         if t == "SayFor":
             self._add(bid,"looks_sayforsecs",parent_id,next_id,
-                inputs={"MESSAGE":self._input(node["text"],bid),"SECS":self._input(node["secs"],bid)}); return bid
+                inputs={"MESSAGE":self._input(node["text"],bid),"SECS":self._num_input(node["secs"],bid)}); return bid
         if t == "Think":
             self._add(bid,"looks_think",parent_id,next_id,inputs={"MESSAGE":self._input(node["text"],bid)}); return bid
         if t == "ThinkFor":
             self._add(bid,"looks_thinkforsecs",parent_id,next_id,
-                inputs={"MESSAGE":self._input(node["text"],bid),"SECS":self._input(node["secs"],bid)}); return bid
+                inputs={"MESSAGE":self._input(node["text"],bid),"SECS":self._num_input(node["secs"],bid)}); return bid
         if t == "SwitchCostume":
             mid = self._menu_shadow("looks_costume","COSTUME",node["value"],bid)
             self._add(bid,"looks_switchcostumeto",parent_id,next_id,inputs={"COSTUME":[1,mid]}); return bid
@@ -1280,9 +1380,9 @@ class ScratchGenerator:
         if t == "NextBackdrop":
             self._add(bid,"looks_nextbackdrop",parent_id,next_id); return bid
         if t == "SetSize":
-            self._add(bid,"looks_setsizeto",parent_id,next_id,inputs={"SIZE":self._input(node["value"],bid)}); return bid
+            self._add(bid,"looks_setsizeto",parent_id,next_id,inputs={"SIZE":self._num_input(node["value"],bid)}); return bid
         if t == "ChangeSize":
-            self._add(bid,"looks_changesizeby",parent_id,next_id,inputs={"CHANGE":self._input(node["value"],bid)}); return bid
+            self._add(bid,"looks_changesizeby",parent_id,next_id,inputs={"CHANGE":self._num_input(node["value"],bid)}); return bid
         if t == "Show":
             self._add(bid,"looks_show",parent_id,next_id); return bid
         if t == "Hide":
@@ -1293,17 +1393,17 @@ class ScratchGenerator:
             self._add(bid,"looks_gotofrontback",parent_id,next_id,fields={"FRONT_BACK":["back",None]}); return bid
         if t == "GoForwardLayers":
             self._add(bid,"looks_goforwardbackwardlayers",parent_id,next_id,
-                inputs={"NUM":self._input(node["value"],bid)},fields={"FORWARD_BACKWARD":["forward",None]}); return bid
+                inputs={"NUM":self._num_input(node["value"],bid)},fields={"FORWARD_BACKWARD":["forward",None]}); return bid
         if t == "GoBackwardLayers":
             self._add(bid,"looks_goforwardbackwardlayers",parent_id,next_id,
-                inputs={"NUM":self._input(node["value"],bid)},fields={"FORWARD_BACKWARD":["backward",None]}); return bid
+                inputs={"NUM":self._num_input(node["value"],bid)},fields={"FORWARD_BACKWARD":["backward",None]}); return bid
         if t == "SetEffect":
             self._add(bid,"looks_seteffectto",parent_id,next_id,
                 inputs={"VALUE":self._input(node["value"],bid)},
                 fields={"EFFECT":[node["effect"].upper(),None]}); return bid
         if t == "ChangeEffect":
             self._add(bid,"looks_changeeffectby",parent_id,next_id,
-                inputs={"CHANGE":self._input(node["value"],bid)},
+                inputs={"CHANGE":self._num_input(node["value"],bid)},
                 fields={"EFFECT":[node["effect"].upper(),None]}); return bid
         if t == "ClearEffects":
             self._add(bid,"looks_cleargraphiceffects",parent_id,next_id); return bid
@@ -1318,9 +1418,9 @@ class ScratchGenerator:
         if t == "StopAllSounds":
             self._add(bid,"sound_stopallsounds",parent_id,next_id); return bid
         if t == "SetVolume":
-            self._add(bid,"sound_setvolumeto",parent_id,next_id,inputs={"VOLUME":self._input(node["value"],bid)}); return bid
+            self._add(bid,"sound_setvolumeto",parent_id,next_id,inputs={"VOLUME":self._num_input(node["value"],bid)}); return bid
         if t == "ChangeVolume":
-            self._add(bid,"sound_changevolumeby",parent_id,next_id,inputs={"CHANGE":self._input(node["value"],bid)}); return bid
+            self._add(bid,"sound_changevolumeby",parent_id,next_id,inputs={"CHANGE":self._num_input(node["value"],bid)}); return bid
 
         # Sensing
         if t == "AskAndWait":
@@ -1339,16 +1439,16 @@ class ScratchGenerator:
             self._add(bid,"pen_penUp",parent_id,next_id); return bid
         if t == "SetPenColor":
             self._add(bid,"pen_setPenColorToColor",parent_id,next_id,
-                inputs={"COLOR":self._input(node["value"],bid)}); return bid
+                inputs={"COLOR":self._num_input(node["value"],bid)}); return bid
         if t == "ChangePenColor":
             self._add(bid,"pen_changePenColorBy",parent_id,next_id,
-                inputs={"COLOR":self._input(node["value"],bid)}); return bid
+                inputs={"COLOR":self._num_input(node["value"],bid)}); return bid
         if t == "SetPenSize":
             self._add(bid,"pen_setPenSizeTo",parent_id,next_id,
-                inputs={"SIZE":self._input(node["value"],bid)}); return bid
+                inputs={"SIZE":self._num_input(node["value"],bid)}); return bid
         if t == "ChangePenSize":
             self._add(bid,"pen_changePenSizeBy",parent_id,next_id,
-                inputs={"SIZE":self._input(node["value"],bid)}); return bid
+                inputs={"SIZE":self._num_input(node["value"],bid)}); return bid
         if t == "StampPen":
             self._add(bid,"pen_stamp",parent_id,next_id); return bid
         if t == "ErasePen":
@@ -1368,8 +1468,11 @@ class ScratchGenerator:
         if t == "CustomCall":
             proccode = self.custom_procs.get(node["name"],
                            node["name"]+" "+" ".join(["%s"]*len(node["args"])))
-            arg_ids  = [new_id() for _ in node["args"]]
-            inputs   = {aid: self._input(arg, bid) for aid, arg in zip(arg_ids, node["args"])}
+            arg_ids = self.custom_arg_ids.get(node["name"], [])
+            if len(arg_ids) != len(node["args"]):
+                # Fallback for unresolved/externally declared custom blocks.
+                arg_ids = [new_id() for _ in node["args"]]
+            inputs = {aid: self._input(arg, bid) for aid, arg in zip(arg_ids, node["args"])}
             mutation = {"tagName":"mutation","children":[],"proccode":proccode,
                         "argumentids":json.dumps(arg_ids),"warp":"false"}
             self._add(bid,"procedures_call",parent_id,next_id,inputs=inputs,mutation=mutation)
@@ -1388,19 +1491,25 @@ class ScratchGenerator:
             self._add(bid,"text",parent_id,None,fields={"TEXT":[node["value"],None]})
             self.blocks[bid]["shadow"] = True; return bid
         if t == "Bool":
-            if node["value"]:
-                self._add(bid,"operator_equals",parent_id,None,
-                    inputs={"OPERAND1":[1,[10,"1"]],"OPERAND2":[1,[10,"1"]]}); return bid
-            inner = new_id()
-            self._add(inner,"operator_not",parent_id,None,inputs={})
-            self._add(bid,"operator_not",parent_id,None,inputs={"OPERAND":[2,inner]}); return bid
+            # Produce an actual Boolean reporter. An empty operator_not input
+            # (the old false implementation) is not a valid false literal.
+            a, b = ("1", "1") if node["value"] else ("1", "0")
+            self._add(bid, "operator_equals", parent_id, None,
+                inputs={"OPERAND1": [1, [10, a]], "OPERAND2": [1, [10, b]]})
+            return bid
         if t == "Var":
             name = node["name"]
             # Ist der Name ein Parameter des aktuellen Custom Blocks?
-            # → argument_reporter_string_number verwenden, NICHT data_variable
             if name in self.current_params:
-                self._add(bid,"argument_reporter_string_number",parent_id,None,
-                    fields={"VALUE":[name,None]}); return bid
+                _, ptype = self.current_params[name]
+                opcode = ("argument_reporter_boolean"
+                          if ptype == "%b"
+                          else "argument_reporter_string_number")
+                self._add(bid, opcode, parent_id, None,
+                          fields={"VALUE": [name, None]})
+                self.blocks[bid]["shadow"] = False
+                self.blocks[bid]["topLevel"] = False
+                return bid
             vid = self._var_id(name)
             self._add(bid,"data_variable",parent_id,None,
                 fields={"VARIABLE":[name,vid]}); return bid
@@ -1430,16 +1539,16 @@ class ScratchGenerator:
                 self._add(bid,"operator_not",parent_id,None,
                     inputs={"OPERAND":self._bool_input(node["operand"],bid)}); return bid
             self._add(bid,"operator_subtract",parent_id,None,
-                inputs={"NUM1":[1,[4,"0"]],"NUM2":self._input(node["operand"],bid)}); return bid
+                inputs={"NUM1":[1,[4,"0"]],"NUM2":self._num_input(node["operand"],bid)}); return bid
         if t == "Random":
             self._add(bid,"operator_random",parent_id,None,
-                inputs={"FROM":self._input(node["from"],bid),"TO":self._input(node["to"],bid)}); return bid
+                inputs={"FROM":self._num_input(node["from"],bid),"TO":self._num_input(node["to"],bid)}); return bid
         if t == "Round":
             self._add(bid,"operator_round",parent_id,None,
-                inputs={"NUM":self._input(node["value"],bid)}); return bid
+                inputs={"NUM":self._num_input(node["value"],bid)}); return bid
         if t == "MathOp":
             self._add(bid,"operator_mathop",parent_id,None,
-                inputs={"NUM":self._input(node["value"],bid)},
+                inputs={"NUM":self._num_input(node["value"],bid)},
                 fields={"OPERATOR":[node["op"],None]}); return bid
         if t == "StrLength":
             self._add(bid,"operator_length",parent_id,None,
@@ -1472,7 +1581,7 @@ class ScratchGenerator:
                 inputs={"TOUCHINGOBJECTMENU":[1,mid]}); return bid
         if t == "TouchingColor":
             self._add(bid,"sensing_touchingcolor",parent_id,None,
-                inputs={"COLOR":self._input(node["color"],bid)}); return bid
+                inputs={"COLOR":self._num_input(node["color"],bid)}); return bid
         if t == "DistanceTo":
             mid = self._menu_shadow("sensing_distancetomenu","DISTANCETOMENU",node["target"],bid)
             self._add(bid,"sensing_distanceto",parent_id,None,
@@ -1491,20 +1600,44 @@ class ScratchGenerator:
         raise ValueError(f"Unbekannter Ausdrucks-Typ: {t!r}")
 
     def gen_custom_def(self, cdef, x=0, y=0):
-        proto_id  = new_id()
-        param_ids = [new_id() for _ in cdef["params"]]
-        proccode  = cdef["name"] + "".join(" %s" for _ in cdef["params"])
-        warp      = str(self.custom_warp.get(cdef["name"], False)).lower()
+        # params ist jetzt [(name, type_code)] wobei type_code = "%s"|"%n"|"%b"
+        # Rückwärtskompatibel: falls noch alte Form (nur strings) → als %s behandeln
+        raw_params = cdef["params"]
+        if raw_params and isinstance(raw_params[0], str):
+            params = [(p, "%s") for p in raw_params]
+        else:
+            params = raw_params   # neue Form: [(name, type_code)]
+
+        param_names = [p[0] for p in params]
+        param_types = [p[1] for p in params]
+        param_ids   = [new_id() for _ in params]
+
+        # proccode: "blockName %n %s %b" je nach Typ
+        proccode = cdef["name"] + "".join(f" {tc}" for tc in param_types)
+        warp     = str(self.custom_warp.get(cdef["name"], False)).lower()
         self.custom_procs[cdef["name"]] = proccode
 
+        # Reporter-Opcode je nach Typ:
+        #   %s / %n → argument_reporter_string_number
+        #   %b      → argument_reporter_boolean
+        REPORTER_OPCODE = {
+            "%s": "argument_reporter_string_number",
+            "%n": "argument_reporter_string_number",
+            "%b": "argument_reporter_boolean",
+        }
+        # Standardwert je nach Typ:
+        #   %s → ""   %n → "0"   %b → "false"
+        DEFAULT_VAL = {"%s": "", "%n": "0", "%b": "false"}
+
+        proto_id     = new_id()
         proto_inputs = {}
-        for pid, pname in zip(param_ids, cdef["params"]):
+        for pid, pname, ptype in zip(param_ids, param_names, param_types):
             ab = new_id()
             self.blocks[ab] = {
-                "opcode":   "argument_reporter_string_number",
-                "next":     None, "parent": proto_id,
-                "inputs":   {}, "fields": {"VALUE": [pname, None]},
-                "shadow":   True, "topLevel": False,
+                "opcode":  REPORTER_OPCODE[ptype],
+                "next":    None, "parent": proto_id,
+                "inputs":  {}, "fields": {"VALUE": [pname, None]},
+                "shadow":  True, "topLevel": False,
             }
             proto_inputs[pid] = [1, ab]
 
@@ -1513,40 +1646,48 @@ class ScratchGenerator:
             "inputs": proto_inputs, "fields": {}, "shadow": True, "topLevel": False,
             "mutation": {
                 "tagName": "mutation", "children": [], "proccode": proccode,
-                "argumentids":       json.dumps(param_ids),
-                "argumentnames":     json.dumps(cdef["params"]),
-                "argumentdefaults":  json.dumps([""] * len(cdef["params"])),
-                "warp": warp,   # "true" = private/schnell, "false" = public/normal
+                "argumentids":      json.dumps(param_ids),
+                "argumentnames":    json.dumps(param_names),
+                "argumentdefaults": json.dumps([DEFAULT_VAL[t] for t in param_types]),
+                "warp": warp,
             },
         }
 
         hat_id = new_id()
         self._add(hat_id, "procedures_definition", None, None,
                   inputs={"custom_block": [1, proto_id]}, top=True, x=x, y=y)
+        # The prototype is structurally nested inside the definition block.
+        self.blocks[proto_id]["parent"] = hat_id
+        self.custom_arg_ids[cdef["name"]] = list(param_ids)
 
-        # ── Wichtig: Parameter für den Body-Scope setzen ──
-        # Während die Body-Blöcke generiert werden, muss gen_expr wissen
-        # welche Namen Parameter sind (→ argument_reporter statt data_variable).
+        # Parameter-Scope für den Body setzen
         old_params = self.current_params
-        self.current_params = {pname: pid for pname, pid in zip(cdef["params"], param_ids)}
+        self.current_params = {
+            pname: (pid, ptype)
+            for pname, pid, ptype in zip(param_names, param_ids, param_types)
+        }
         first = self._gen_seq(cdef["body"], hat_id)
-        self.current_params = old_params   # Scope verlassen
-        # ─────────────────────────────────────────────────
+        self.current_params = old_params
 
         self.blocks[hat_id]["next"] = first
         return hat_id
 
     def gen_target(self, target_node):
         self.blocks = {}; self.variables = {}; self.lists = {}
-        self.broadcasts = {}; self.custom_procs = {}
-        self.current_params = {}
-        # private void → warp:true (läuft ohne Screen-Refresh, schneller)
+        self.broadcasts = {}; self.custom_procs = {}; self.custom_arg_ids = {}
+        self.current_params = {}; self._var_scope = {}
+        # private void / hidden void → warp:true (läuft ohne Screen-Refresh, schneller)
         self.custom_warp = {
-            cdef["name"]: (cdef.get("visibility") == "private")
+            cdef["name"]: cdef.get("warp", False)
             for cdef in target_node.get("customDefs", [])
         }
-        for cdef in target_node.get("customDefs",[]):
-            self.custom_procs[cdef["name"]] = cdef["name"]+"".join(" %s" for _ in cdef["params"])
+        for cdef in target_node.get("customDefs", []):
+            raw = cdef["params"]
+            if raw and isinstance(raw[0], str):
+                types = ["%s"] * len(raw)
+            else:
+                types = [p[1] for p in raw]
+            self.custom_procs[cdef["name"]] = cdef["name"] + "".join(f" {t}" for t in types)
         x_off = 0
         for cdef in target_node.get("customDefs",[]):
             self.gen_custom_def(cdef, x=x_off, y=-300); x_off += 300
@@ -1556,20 +1697,29 @@ class ScratchGenerator:
             first  = self._gen_seq(script["body"], hat_id)
             self.blocks[hat_id]["next"] = first
             x_off += 300
-        return self.blocks, self.variables, self.lists, self.broadcasts
+        return self.blocks, self.variables, self.lists, self.broadcasts, self._var_scope
 
 
 # ═══════════════════════════════════════════════════════
 #  4.  project.json Zusammenbau
 # ═══════════════════════════════════════════════════════
 def build_project(ast: dict, asset_mgr: AssetManager) -> dict:
+    """
+    Variablen-Scope:
+      public var  → in Stage gespeichert (global, alle Sprites können lesen/schreiben)
+      private var → im Sprite gespeichert (nur dieser Sprite)
+    Variablen-Anzeige:
+      shown  → Monitor sichtbar (Standard)
+      hidden → Monitor versteckt (hideVariable-Block generiert)
+    """
     gen = ScratchGenerator(); targets = []; all_broadcasts = {}
 
+    # Stage
     stage_node = next((t for t in ast["targets"] if t["type"]=="Stage"), None)
     stage_blocks, stage_vars, stage_lists = {}, {}, {}
     if stage_node:
         print(f"  Stage '{stage_node['name']}':")
-        stage_blocks, stage_vars, stage_lists, bcast = gen.gen_target(stage_node)
+        stage_blocks, stage_vars, stage_lists, bcast, _ = gen.gen_target(stage_node)
         all_broadcasts.update(bcast)
         backdrops = []
         for bd in stage_node.get("backdrops",[]):
@@ -1580,19 +1730,33 @@ def build_project(ast: dict, asset_mgr: AssetManager) -> dict:
     else:
         backdrops = [asset_mgr.load_backdrop(None, "Hintergrund1")]; sounds = []
 
-    targets.append({
+    stage_target = {
         "isStage":True,"name":"Stage",
-        "variables":{vid:[name,0]  for name,vid in stage_vars.items()},
-        "lists":     {lid:[name,[]] for name,lid in stage_lists.items()},
+        "variables":{vid:[name,0] for name,vid in stage_vars.items()},
+        "lists":    {lid:[name,[]] for name,lid in stage_lists.items()},
         "broadcasts":{},"blocks":stage_blocks,"comments":{},"currentCostume":0,
         "costumes":backdrops,"sounds":sounds,"layerOrder":0,"tempo":60,"volume":100,
         "videoTransparency":50,"videoState":"on","textToSpeechLanguage":None,
-    })
+    }
+    targets.append(stage_target)
 
+    # Sprites
     for i, snode in enumerate([t for t in ast["targets"] if t["type"]=="Sprite"]):
         print(f"  Sprite '{snode['name']}':")
-        blocks, variables, lists, bcast = gen.gen_target(snode)
+        blocks, variables, lists, bcast, var_scope = gen.gen_target(snode)
         all_broadcasts.update(bcast)
+
+        # public var → Stage (global), private var → Sprite (lokal)
+        sprite_vars = {}
+        for var_name, vid in variables.items():
+            scope = var_scope.get(var_name, "public")
+            if scope == "private":
+                sprite_vars[vid] = [var_name, 0]
+                print(f"    var '{var_name}': private (Sprite-lokal)")
+            else:
+                stage_target["variables"][vid] = [var_name, 0]
+                print(f"    var '{var_name}': public (global/Stage)")
+
         costumes = []
         for c in snode.get("costumes",[]):
             print(f"    Kostüm '{c['name']}'" + (f" ← {c['path']}" if c["path"] else ""))
@@ -1601,8 +1765,8 @@ def build_project(ast: dict, asset_mgr: AssetManager) -> dict:
         sounds = [asset_mgr.load_sound(s["path"], s["name"]) for s in snode.get("sounds",[])]
         targets.append({
             "isStage":False,"name":snode["name"],
-            "variables":{vid:[name,0]  for name,vid in variables.items()},
-            "lists":     {lid:[name,[]] for name,lid in lists.items()},
+            "variables":sprite_vars,
+            "lists":    {lid:[name,[]] for name,lid in lists.items()},
             "broadcasts":{},"blocks":blocks,"comments":{},"currentCostume":0,
             "costumes":costumes,"sounds":sounds,"layerOrder":i+1,
             "visible":True,"x":0,"y":0,"size":100,"direction":90,
@@ -1694,14 +1858,38 @@ class Validator:
                 self.errors.append(f"{ctx}: {node['name']}() – nicht definiert. Definiert: {sorted(defined) or '(keine)'}")
             else:
                 cdef = next(cd for cd in target["customDefs"] if cd["name"]==node["name"])
-                if len(node["args"]) != len(cdef["params"]):
-                    self.errors.append(f"{ctx}: {node['name']}() – {len(cdef['params'])} Arg(e) erwartet, {len(node['args'])} gegeben.")
+                raw = cdef["params"]
+                params = raw if raw and not isinstance(raw[0], str) else [(p,"%s") for p in raw]
+                if len(node["args"]) != len(params):
+                    self.errors.append(f"{ctx}: {node['name']}() – {len(params)} Arg(e) erwartet, {len(node['args'])} gegeben.")
+        # Warnung wenn ungetypter Parameter (%s) in Zahlen-Slot landet
+        elif t in ("SayFor","ThinkFor"):
+            self._check_param_type(node["secs"], ctx, f"{t.lower()} Sekunden", target)
+        elif t in ("Wait",):
+            self._check_param_type(node["value"], ctx, "wait Sekunden", target)
+        elif t in ("Move","TurnLeft","TurnRight","SetX","SetY","ChangeX","ChangeY",
+                   "SetSize","ChangeSize","SetVolume","ChangeVolume",
+                   "SetPenSize","ChangePenSize","GoForwardLayers","GoBackwardLayers"):
+            self._check_param_type(node["value"], ctx, t, target)
         elif t == "Animate" and cn:
             for cname in node["costumes"]:
                 if cname not in cn:
                     self.errors.append(f"{ctx}: animate() – Kostüm '{cname}' nicht definiert. Vorhanden: {sorted(cn)}")
         for sub in ("body","then","else"):
             if node.get(sub): self._stmts(node[sub], ctx, cn, sn, sp, target)
+
+    def _check_param_type(self, expr, ctx, slot_name, target):
+        """
+        Warnt wenn ein ungetypter Parameter (%s) in einem Zahlen-Slot landet.
+        Das führt dazu dass Scratch den Wert als 0 interpretiert.
+        """
+        if not expr or expr.get("type") != "Var":
+            return
+        var_name = expr["name"]
+        # Ist der Name ein Parameter eines Custom Blocks?
+        for cdef in target.get("customDefs", []):
+            raw = cdef["params"]
+            params = raw if raw and not isinstance(raw[0], str) else [(p,"%s") for p in raw]
 
     def _range(self, expr, ctx, name, lo, hi):
         if expr and expr.get("type") == "Num":
@@ -1735,13 +1923,19 @@ APP_PROFILES = {
         "label": "TurboWarp",
         "download": "https://turbowarp.org/desktop",
         "Windows": {
+            # TurboWarp Desktop kann verschiedene .exe-Namen haben je nach Version/Installation
+            # _find_turbowarp_exe() sucht zur Laufzeit den echten Namen
             "candidates": [
-                r"C:\Program Files\TurboWarp\TurboWarp.exe",
-                r"C:\Program Files (x86)\TurboWarp\TurboWarp.exe",
+                str(Path.home()/"AppData/Local/Programs/TurboWarp/TurboWarp Desktop.exe"),
                 str(Path.home()/"AppData/Local/Programs/TurboWarp/TurboWarp.exe"),
+                str(Path.home()/"AppData/Local/Programs/turbowarp-desktop/TurboWarp Desktop.exe"),
                 str(Path.home()/"AppData/Local/Programs/turbowarp-desktop/TurboWarp.exe"),
+                r"C:\Program Files\TurboWarp\TurboWarp Desktop.exe",
+                r"C:\Program Files\TurboWarp\TurboWarp.exe",
+                r"C:\Program Files (x86)\TurboWarp\TurboWarp Desktop.exe",
             ],
-            "kill": "TurboWarp.exe",
+            # kill wird zur Laufzeit dynamisch ermittelt — siehe _get_turbowarp_pname()
+            "kill": "TurboWarp Desktop.exe",
             "launch": lambda exe, f: [exe, f],
         },
         "Darwin": {
@@ -1750,7 +1944,6 @@ APP_PROFILES = {
                 str(Path.home()/"Applications/TurboWarp.app/Contents/MacOS/TurboWarp"),
             ],
             "kill": "TurboWarp",
-            # macOS: open -n -a AppName --args file  öffnet neue Instanz
             "launch": lambda exe, f: ["open", "-n", "-a", "TurboWarp", "--args", f],
         },
         "Linux": {
@@ -1759,7 +1952,6 @@ APP_PROFILES = {
                 "/usr/local/bin/turbowarp-desktop",
                 str(Path.home()/".local/bin/turbowarp-desktop"),
                 "/snap/bin/turbowarp-desktop",
-                str(Path.home()/".local/share/applications/turbowarp-desktop"),
             ],
             "kill": "turbowarp-desktop",
             "launch": lambda exe, f: [exe, f],
@@ -1828,49 +2020,38 @@ def _save_win_states(states: dict):
 
 def _get_window_geometry_windows(process_name: str) -> dict | None:
     """
-    Liest Position und Größe des Hauptfensters eines laufenden Prozesses auf Windows
-    via PowerShell + Win32-API (kein ctypes nötig).
-    Gibt {"x": int, "y": int, "w": int, "h": int, "maximized": bool} zurück.
+    Liest Position und Größe des Hauptfensters via PowerShell + Win32.
+    Gibt {"x", "y", "w", "h", "maximized"} zurück oder None.
     """
-    script = f"""
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public class Win32 {{
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
-    [StructLayout(LayoutKind.Sequential)] public struct RECT {{ public int L,T,R,B; }}
-}}
-"@
-$procs = Get-Process -Name "{process_name.replace('.exe','')}" -ErrorAction SilentlyContinue
+    pname = process_name.replace(".exe", "")
+    script = _WIN32_SCRIPT_HEADER + f"""
+$procs = Get-Process -Name "{pname}" -ErrorAction SilentlyContinue
 foreach ($p in $procs) {{
     if ($p.MainWindowHandle -ne 0) {{
-        $r = New-Object Win32+RECT
-        [Win32]::GetWindowRect($p.MainWindowHandle, [ref]$r) | Out-Null
-        $max = [Win32]::IsZoomed($p.MainWindowHandle)
-        Write-Output "$($r.L),$($r.T),$($r.R - $r.L),$($r.B - $r.T),$max"
+        $r = New-Object WinHelper+RECT
+        [WinHelper]::GetWindowRect($p.MainWindowHandle, [ref]$r) | Out-Null
+        $max = [WinHelper]::IsZoomed($p.MainWindowHandle)
+        $min = [WinHelper]::IsIconic($p.MainWindowHandle)
+        if (-not $min) {{
+            Write-Output "$($r.L),$($r.T),$($r.R - $r.L),$($r.B - $r.T),$max"
+        }}
         break
     }}
 }}
 """
+    line = _run_ps(script, timeout=6)
+    if not line:
+        return None
+    parts = line.split(",")
+    if len(parts) < 5:
+        return None
     try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", script],
-            capture_output=True, text=True, timeout=6
-        )
-        line = result.stdout.strip()
-        if not line:
-            return None
-        parts = line.split(",")
-        if len(parts) < 5:
-            return None
         x, y, w, h = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
         maximized = parts[4].strip().lower() == "true"
-        # Plausibilitäts-Check: Fenster muss mindestens 200x200 groß sein
         if w < 200 or h < 200:
             return None
         return {"x": x, "y": y, "w": w, "h": h, "maximized": maximized}
-    except Exception:
+    except (ValueError, IndexError):
         return None
 
 
@@ -1975,118 +2156,305 @@ def save_window_state(app: str, process_name: str):
         print(f"  ℹ  Fensterposition konnte nicht ausgelesen werden")
 
 
-def restore_window_state(app: str, process_name: str, pid: int | None = None):
+def restore_window_state(app: str, process_name: str):
     """
-    Wartet bis das neue Fenster erscheint und stellt dann
-    Position und Größe aus der State-Datei wieder her.
-    Läuft in einem Hintergrund-Thread damit der Hauptprozess nicht blockiert.
+    Wartet in einem Hintergrund-Thread bis das neue Fenster erscheint
+    und stellt dann exakt Position + Größe wieder her.
+
+    Strategie:
+      1. Warte bis der Prozess läuft UND ein Fenster-Handle hat
+         (Electron braucht je nach System 1-5 Sekunden)
+      2. Warte nochmal kurz bis das Fenster vollständig gerendert ist
+         (sonst überschreibt Electron unsere Größe beim eigenen Init)
+      3. Setze Position+Größe
+      4. Verifiziere — falls das Fenster danach wieder auf Standard
+         zurückspringt (Electron-Bug), nochmal setzen
     """
     import threading
 
     states = _load_win_states()
     geo = states.get(app)
     if not geo:
-        return   # Noch kein gespeicherter Zustand
+        return
 
     def _restore():
         system = platform.system()
-        # Kurz warten bis das Fenster geöffnet ist
-        time.sleep(1.8)
+        pname  = process_name.replace(".exe", "")
+        MAX_WAIT = 15       # Sekunden maximal warten
+        POLL     = 0.4      # Prüfintervall
 
-        if system == "Windows":
-            _restore_windows(process_name, geo)
-        elif system == "Darwin":
-            label = APP_PROFILES[app]["label"]
-            _restore_macos(label, geo)
+        # ── Schritt 1: Warten bis Prozess+Fenster da ist ──────────
+        print(f"  🔄  Warte auf Fenster von {pname}...")
+        deadline = time.time() + MAX_WAIT
+        hwnd     = None
+
+        while time.time() < deadline:
+            hwnd = _get_hwnd_windows(pname) if system == "Windows" else True
+            if hwnd:
+                break
+            time.sleep(POLL)
+
+        if not hwnd:
+            print(f"  ⚠  Fenster von {pname} nicht gefunden – Position nicht wiederhergestellt")
+            return
+
+        # ── Schritt 2: Warten bis Electron die Seite geladen hat ─────
+        # Electron setzt nach dem Rendern der Seite nochmal seine eigene
+        # Startgröße. Wir müssen DANACH kommen — daher länger warten.
+        # TurboWarp/Scratch brauchen auf schnellen Systemen ~2-3s zum Laden.
+        time.sleep(3.0)
+
+        # ── Schritt 3+4: Setzen und verifizieren (bis zu 5 Versuche) ──
+        tol = 12   # Pixel-Toleranz
+        success = False
+        for attempt in range(5):
+            if system == "Windows":
+                ok = _apply_geometry_windows(pname, geo)
+            elif system == "Darwin":
+                ok = _apply_geometry_macos(APP_PROFILES[app]["label"], geo)
+            else:
+                ok = _apply_geometry_linux(pname, geo)
+
+            # Warten damit Electron nicht überschreibt
+            time.sleep(0.8)
+
+            # Verifikation (nur Windows)
+            if system == "Windows":
+                actual = _get_window_geometry_windows(pname)
+                if actual is None:
+                    continue
+                if geo.get("maximized"):
+                    if actual.get("maximized"):
+                        success = True; break
+                else:
+                    dx = abs(actual["x"] - geo["x"])
+                    dy = abs(actual["y"] - geo["y"])
+                    dw = abs(actual["w"] - geo["w"])
+                    dh = abs(actual["h"] - geo["h"])
+                    print(f"  ↳  Versuch {attempt+1}: ist ({actual['x']},{actual['y']} {actual['w']}×{actual['h']}) soll ({geo['x']},{geo['y']} {geo['w']}×{geo['h']})")
+                    if dx<=tol and dy<=tol and dw<=tol and dh<=tol:
+                        success = True; break
+                    # Noch nicht korrekt → kurz warten und nochmal
+                    time.sleep(0.5)
+            else:
+                success = ok; break
+
+        pos = "maximiert" if geo.get("maximized") else f"{geo['x']},{geo['y']} {geo['w']}×{geo['h']}"
+        if success:
+            print(f"  ✓  Fensterposition wiederhergestellt ({pos})")
         else:
-            _restore_linux(process_name, geo)
+            print(f"  ⚠  Fenster springt zurück — TurboWarp/Scratch überschreibt Position")
 
     t = threading.Thread(target=_restore, daemon=True)
     t.start()
 
 
-def _restore_windows(process_name: str, geo: dict):
+# ── Windows-spezifische Hilfsfunktionen ───────────────────────────────────────
+
+# Einmaliges PowerShell-Skript das Add-Type nur beim ersten Aufruf lädt.
+# Wir cachen den Skript-Block um wiederholte Add-Type-Kompilierungen zu vermeiden.
+_WIN32_SCRIPT_HEADER = r"""
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+if (-not ([System.Management.Automation.PSTypeName]'WinHelper').Type) {
+    Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class WinHelper {
+    [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr h,int x,int y,int w,int h,bool r);
+    [DllImport("user32.dll",SetLastError=true)]
+    public static extern bool SetWindowPos(IntPtr h,IntPtr hAfter,int x,int y,int w,int h,uint flags);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int n);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h,out RECT r);
+    [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+    [StructLayout(LayoutKind.Sequential)] public struct RECT{public int L,T,R,B;}
+    // SetWindowPos flags
+    public const uint SWP_SHOWWINDOW   = 0x0040;
+    public const uint SWP_NOACTIVATE   = 0x0010;
+    public const uint SWP_NOZORDER     = 0x0004;
+}
+"@
+}
+"""
+
+def _run_ps(script: str, timeout: int = 8) -> str:
+    """
+    Führt ein PowerShell-Skript aus und gibt stdout als UTF-8 String zurück.
+    Behebt den cp1252-UnicodeDecodeError auf deutschen Windows-Systemen.
+    """
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            timeout=timeout,
+            # Explizit UTF-8 für stdout/stderr — verhindert cp1252-Fehler
+            encoding="utf-8",
+            errors="replace",
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _get_hwnd_windows(pname: str) -> bool:
+    """Gibt True zurück wenn der Prozess existiert und ein Fenster-Handle hat."""
+    script = _WIN32_SCRIPT_HEADER + f"""
+$p = Get-Process -Name "{pname}" -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($p -and $p.MainWindowHandle -ne 0) {{ Write-Output "1" }}
+"""
+    return _run_ps(script, timeout=5) == "1"
+
+
+def _apply_geometry_windows(pname: str, geo: dict) -> bool:
+    """
+    Setzt Fenstergeometrie via SetWindowPos (zuverlässiger als MoveWindow für Electron).
+    SetWindowPos mit SWP_SHOWWINDOW | SWP_NOZORDER funktioniert auch wenn
+    MoveWindow von Electron ignoriert wird.
+    """
     if geo.get("maximized"):
-        script = f"""
-$p = Get-Process -Name "{process_name.replace('.exe','')}" -ErrorAction SilentlyContinue | Select-Object -First 1
+        script = _WIN32_SCRIPT_HEADER + f"""
+$p = Get-Process -Name "{pname}" -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($p -and $p.MainWindowHandle -ne 0) {{
-    Add-Type -Name W -Namespace W -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);'
-    [W.W]::ShowWindow($p.MainWindowHandle, 3)
+    [WinHelper]::ShowWindow($p.MainWindowHandle, 3) | Out-Null
+    Write-Output "ok"
 }}
 """
     else:
         x, y, w, h = geo["x"], geo["y"], geo["w"], geo["h"]
-        script = f"""
-Add-Type @"
-using System; using System.Runtime.InteropServices;
-public class WM {{
-    [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr h, int x, int y, int w, int h, bool r);
-}}
-"@
-$p = Get-Process -Name "{process_name.replace('.exe','')}" -ErrorAction SilentlyContinue | Select-Object -First 1
+        # SWP_SHOWWINDOW (0x40) | SWP_NOZORDER (0x04) | SWP_NOACTIVATE (0x10) = 0x54
+        script = _WIN32_SCRIPT_HEADER + f"""
+$p = Get-Process -Name "{pname}" -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($p -and $p.MainWindowHandle -ne 0) {{
-    [WM]::MoveWindow($p.MainWindowHandle, {x}, {y}, {w}, {h}, $true)
+    $hwnd = $p.MainWindowHandle
+    # SW_RESTORE zuerst falls maximiert/minimiert
+    [WinHelper]::ShowWindow($hwnd, 9) | Out-Null
+    Start-Sleep -Milliseconds 300
+
+    # SetWindowPos ist zuverlässiger als MoveWindow für Electron-Apps
+    # Flags: SWP_SHOWWINDOW | SWP_NOZORDER | SWP_NOACTIVATE
+    $flags = [uint32]0x54
+    $hAfter = [IntPtr]::Zero
+    [WinHelper]::SetWindowPos($hwnd, $hAfter, {x}, {y}, {w}, {h}, $flags) | Out-Null
+    Start-Sleep -Milliseconds 200
+    # Zweiter Aufruf — Electron kann den ersten beim Laden überschreiben
+    [WinHelper]::SetWindowPos($hwnd, $hAfter, {x}, {y}, {w}, {h}, $flags) | Out-Null
+
+    # Verifizierung: Lese Position zurück
+    $r = New-Object WinHelper+RECT
+    [WinHelper]::GetWindowRect($hwnd, [ref]$r) | Out-Null
+    $ax = $r.L; $ay = $r.T; $aw = $r.R - $r.L; $ah = $r.B - $r.T
+    Write-Output "set:$ax,$ay,${{aw}},${{ah}}"
 }}
 """
-    try:
-        subprocess.run(["powershell", "-NoProfile", "-Command", script],
-                       capture_output=True, timeout=6)
-    except Exception:
-        pass
+    out = _run_ps(script, timeout=10)
+    if out.startswith("set:"):
+        # Verifizieren: gesetzt? (8px Toleranz)
+        try:
+            parts = out[4:].split(",")
+            ax, ay, aw, ah = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+            if abs(ax-geo["x"])>8 or abs(ay-geo["y"])>8:
+                print(f"  ⚠  Position nicht korrekt gesetzt: ist {ax},{ay} erwartet {geo['x']},{geo['y']}")
+                return False
+            return True
+        except Exception:
+            return True  # Setzen lief durch, Verifikation fehlgeschlagen
+    return out == "ok"
 
 
-def _restore_macos(app_name: str, geo: dict):
+def _apply_geometry_macos(app_name: str, geo: dict) -> bool:
     x, y, w, h = geo["x"], geo["y"], geo["w"], geo["h"]
     script = f"""
 tell application "System Events"
-    set p to first process whose displayed name contains "{app_name}"
-    set w to first window of p
-    set bounds of w to {{{x}, {y}, {x+w}, {y+h}}}
+    try
+        set proc to first process whose displayed name contains "{app_name}"
+        set win to first window of proc
+        set bounds of win to {{{x}, {y}, {x+w}, {y+h}}}
+        return "ok"
+    on error
+        return "err"
+    end try
 end tell
 """
     try:
-        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=6)
+        r = subprocess.run(["osascript","-e",script], capture_output=True, text=True, timeout=8)
+        return "ok" in r.stdout
     except Exception:
-        pass
+        return False
 
 
-def _restore_linux(process_name: str, geo: dict):
+def _apply_geometry_linux(pname: str, geo: dict) -> bool:
     x, y, w, h = geo["x"], geo["y"], geo["w"], geo["h"]
     try:
-        find = subprocess.run(
-            ["xdotool", "search", "--name", process_name],
-            capture_output=True, text=True, timeout=4
-        )
+        find = subprocess.run(["xdotool","search","--name",pname],
+                              capture_output=True, text=True, timeout=4)
         wids = find.stdout.strip().split()
         if not wids:
-            return
+            find2 = subprocess.run(["xdotool","search","--class",pname],
+                                   capture_output=True, text=True, timeout=4)
+            wids = find2.stdout.strip().split()
+        if not wids:
+            return False
         wid = wids[0]
-        subprocess.run(["xdotool", "windowmove", wid, str(x), str(y)],
+        subprocess.run(["xdotool","windowmove",wid,str(x),str(y)],
                        capture_output=True, timeout=4)
-        subprocess.run(["xdotool", "windowsize", wid, str(w), str(h)],
+        subprocess.run(["xdotool","windowsize",wid,str(w),str(h)],
                        capture_output=True, timeout=4)
+        return True
     except Exception:
-        pass
+        return False
+
+
+def _get_running_pname(candidates: list[str]) -> str | None:
+    """
+    Findet den echten Prozessnamen eines laufenden Programms aus einer Liste
+    von Kandidaten. Gibt den ersten laufenden zurück, oder None.
+    Funktioniert auf Windows via PowerShell Get-Process.
+    """
+    if platform.system() != "Windows":
+        return None
+    # Alle Kandidaten ohne .exe-Extension für Get-Process
+    names = [c.replace(".exe","") for c in candidates]
+    name_list = ", ".join(f'"{n}"' for n in names)
+    script = (
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n"
+        f"$names = @({name_list})\n"
+        "foreach ($n in $names) {\n"
+        "    $p = Get-Process -Name $n -ErrorAction SilentlyContinue | Select-Object -First 1\n"
+        "    if ($p) { Write-Output \"$($p.ProcessName).exe\"; break }\n"
+        "}"
+    )
+    result = _run_ps(script, timeout=5)
+    return result if result else None
+
+
+def _find_turbowarp_pname() -> str:
+    """
+    Findet den echten Prozessnamen von TurboWarp Desktop.
+    Probiert verschiedene bekannte Namen und gibt den laufenden zurück.
+    Fallback: 'TurboWarp Desktop.exe'
+    """
+    candidates = [
+        "TurboWarp Desktop",
+        "TurboWarp",
+        "turbowarp-desktop",
+        "turbowarpdesktop",
+    ]
+    found = _get_running_pname([f"{c}.exe" for c in candidates])
+    return found or "TurboWarp Desktop.exe"
 
 
 def _find_scratch_store_aumid() -> str | None:
     """
-    Sucht die AUMID (Application User Model ID) der Microsoft-Store-Version
-    von Scratch via PowerShell Get-AppxPackage.
-    Gibt z.B. 'ScratchFoundation.Scratch3_abc123xyz!App' zurück, oder None.
+    Sucht die AUMID der Microsoft-Store-Version von Scratch via PowerShell.
     """
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-AppxPackage *Scratch* | Select-Object -ExpandProperty PackageFamilyName"],
-            capture_output=True, text=True, timeout=8
-        )
-        family = result.stdout.strip()
-        if family:
-            # PackageFamilyName  →  AUMID = FamilyName!App
-            return f"{family}!App"
-    except Exception:
-        pass
+    family = _run_ps(
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n"
+        "Get-AppxPackage *Scratch* | Select-Object -ExpandProperty PackageFamilyName",
+        timeout=8
+    )
+    if family:
+        return f"{family}!App"
     return None
 
 
@@ -2131,12 +2499,21 @@ def launch_app(sb3_path: str, app: str, replace: bool):
 
     # ── Fensterposition speichern, dann beenden ───────
     if replace:
-        kill = sys_profile["kill"]
-        # Zuerst Position auslesen (solange das Fenster noch offen ist)
+        # Echten laufenden Prozessnamen ermitteln (wichtig für TurboWarp!)
+        if system == "Windows" and app == "turbowarp":
+            kill = _find_turbowarp_pname()
+            print(f"  🔍  Prozessname: {kill}")
+        else:
+            kill = sys_profile["kill"]
+
+        # Position auslesen solange Fenster noch offen ist
         save_window_state(app, kill)
         print(f"  ⏹  Beende laufende {label}-Instanzen...")
         if system == "Windows":
-            subprocess.run(["taskkill", "/F", "/IM", kill], capture_output=True)
+            # Alle TurboWarp-Varianten beenden
+            for pname in ["TurboWarp Desktop", "TurboWarp", "turbowarp-desktop"]:
+                subprocess.run(["taskkill", "/F", "/IM", f"{pname}.exe"],
+                               capture_output=True)
         else:
             subprocess.run(["pkill", "-f", kill], capture_output=True)
         time.sleep(0.8)
@@ -2153,7 +2530,7 @@ def launch_app(sb3_path: str, app: str, replace: bool):
             print(f"     (klassische Installation: {exe})")
             subprocess.Popen([exe, sb3_abs])
             if replace:
-                restore_window_state(app, sys_profile["kill"])
+                restore_window_state(app, Path(exe).name)
             return
 
         # ── Microsoft Store-Version ───────────────────
@@ -2176,21 +2553,11 @@ def launch_app(sb3_path: str, app: str, replace: bool):
             print(f"     {sb3_abs}")
             print()
             # App starten (ohne Dateiargument — Store-Sandbox erlaubt das nicht)
-            subprocess.Popen(
-                ["powershell", "-NoProfile", "-Command",
-                 f'Start-Process "shell:AppsFolder\\{aumid}"'],
-                capture_output=True
-            )
-            # Dateipfad in die Zwischenablage kopieren damit der User ihn leicht einfügen kann
-            try:
-                subprocess.run(
-                    ["powershell", "-NoProfile", "-Command",
-                     f'Set-Clipboard -Value "{sb3_abs}"'],
-                    capture_output=True, timeout=3
-                )
+            _run_ps(f'Start-Process "shell:AppsFolder\\{aumid}"', timeout=5)
+            # Dateipfad in die Zwischenablage kopieren
+            result = _run_ps(f'Set-Clipboard -Value "{sb3_abs}"; Write-Output "ok"', timeout=3)
+            if result == "ok":
                 print("  📋  Dateipfad wurde in die Zwischenablage kopiert.")
-            except Exception:
-                pass
             return
 
         # ── Letzter Versuch: WindowsApps-Ordner ──────
@@ -2225,7 +2592,9 @@ def launch_app(sb3_path: str, app: str, replace: bool):
     cmd = sys_profile["launch"](exe, sb3_abs)
     subprocess.Popen(cmd)
     if replace:
-        restore_window_state(app, sys_profile["kill"])
+        # Für restore: Prozessname aus dem exe-Pfad ableiten
+        exe_name = Path(exe).name
+        restore_window_state(app, exe_name)
 
 
 # ═══════════════════════════════════════════════════════
@@ -2324,7 +2693,7 @@ def watch_mode(src_path: Path, outfile: str, app_mode: tuple | None):
 # ═══════════════════════════════════════════════════════
 def print_help():
     print("""
-scratch_transpiler.py  v4.1
+Transpiler.py  v5.0
 ────────────────────────────────────────────────────────
 VERWENDUNG:
   python scratch_transpiler.py <eingabe.java> [Optionen]
