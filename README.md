@@ -24,6 +24,9 @@ Der Transpiler unterstützt die wichtigsten Scratch-Bausteine, Assets, Erweiteru
 
 - Python 3.10+
 - Optional: `Pillow` für Rasterbilder wie PNG/JPG/BMP/WebP
+- sudo apt install xdotool
+(Linux (nur nötig, wenn --turbowarp-replace / --scratch-replace genutzt wird))
+
 
 Installation:
 
