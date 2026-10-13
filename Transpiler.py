@@ -2019,40 +2019,9 @@ def _save_win_states(states: dict):
 
 
 def _get_window_geometry_windows(process_name: str) -> dict | None:
-    """
-    Liest Position und Größe des Hauptfensters via PowerShell + Win32.
-    Gibt {"x", "y", "w", "h", "maximized"} zurück oder None.
-    """
-    pname = process_name.replace(".exe", "")
-    script = _WIN32_SCRIPT_HEADER + f"""
-$procs = Get-Process -Name "{pname}" -ErrorAction SilentlyContinue
-foreach ($p in $procs) {{
-    if ($p.MainWindowHandle -ne 0) {{
-        $r = New-Object WinHelper+RECT
-        [WinHelper]::GetWindowRect($p.MainWindowHandle, [ref]$r) | Out-Null
-        $max = [WinHelper]::IsZoomed($p.MainWindowHandle)
-        $min = [WinHelper]::IsIconic($p.MainWindowHandle)
-        if (-not $min) {{
-            Write-Output "$($r.L),$($r.T),$($r.R - $r.L),$($r.B - $r.T),$max"
-        }}
-        break
-    }}
-}}
-"""
-    line = _run_ps(script, timeout=6)
-    if not line:
-        return None
-    parts = line.split(",")
-    if len(parts) < 5:
-        return None
-    try:
-        x, y, w, h = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
-        maximized = parts[4].strip().lower() == "true"
-        if w < 200 or h < 200:
-            return None
-        return {"x": x, "y": y, "w": w, "h": h, "maximized": maximized}
-    except (ValueError, IndexError):
-        return None
+    """Liest die Geometrie des sichtbaren TurboWarp-/Scratch-Fensters via Win32."""
+    result = _windows_find_window(process_name)
+    return result[2] if result else None
 
 
 def _get_window_geometry_macos(app_name: str) -> dict | None:
@@ -2249,118 +2218,203 @@ def restore_window_state(app: str, process_name: str):
     t.start()
 
 
-# ── Windows-spezifische Hilfsfunktionen ───────────────────────────────────────
-
-# Einmaliges PowerShell-Skript das Add-Type nur beim ersten Aufruf lädt.
-# Wir cachen den Skript-Block um wiederholte Add-Type-Kompilierungen zu vermeiden.
-_WIN32_SCRIPT_HEADER = r"""
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$OutputEncoding = [System.Text.Encoding]::UTF8
-if (-not ([System.Management.Automation.PSTypeName]'WinHelper').Type) {
-    Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public class WinHelper {
-    [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr h,int x,int y,int w,int h,bool r);
-    [DllImport("user32.dll",SetLastError=true)]
-    public static extern bool SetWindowPos(IntPtr h,IntPtr hAfter,int x,int y,int w,int h,uint flags);
-    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int n);
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h,out RECT r);
-    [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
-    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
-    [StructLayout(LayoutKind.Sequential)] public struct RECT{public int L,T,R,B;}
-    // SetWindowPos flags
-    public const uint SWP_SHOWWINDOW   = 0x0040;
-    public const uint SWP_NOACTIVATE   = 0x0010;
-    public const uint SWP_NOZORDER     = 0x0004;
-}
-"@
-}
-"""
-
 def _run_ps(script: str, timeout: int = 8) -> str:
-    """
-    Führt ein PowerShell-Skript aus und gibt stdout als UTF-8 String zurück.
-    Behebt den cp1252-UnicodeDecodeError auf deutschen Windows-Systemen.
-    """
+    """Führt ein PowerShell-Skript aus und liefert die bereinigte Standardausgabe."""
     try:
         result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", script],
+            [
+                "powershell.exe", "-NoLogo", "-NoProfile",
+                "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                "-Command", script,
+            ],
             capture_output=True,
-            timeout=timeout,
-            # Explizit UTF-8 für stdout/stderr — verhindert cp1252-Fehler
+            text=True,
             encoding="utf-8",
             errors="replace",
+            timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+        if result.returncode != 0 and not result.stdout.strip():
+            return ""
         return result.stdout.strip()
-    except Exception:
+    except (OSError, subprocess.TimeoutExpired):
         return ""
 
 
-def _get_hwnd_windows(pname: str) -> bool:
-    """Gibt True zurück wenn der Prozess existiert und ein Fenster-Handle hat."""
-    script = _WIN32_SCRIPT_HEADER + f"""
-$p = Get-Process -Name "{pname}" -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($p -and $p.MainWindowHandle -ne 0) {{ Write-Output "1" }}
-"""
-    return _run_ps(script, timeout=5) == "1"
+# ── Windows-spezifische Hilfsfunktionen ───────────────────────────────────────
+# Nutzt ausschließlich ctypes aus der Python-Standardbibliothek. Dadurch hängt
+# die Fensterverwaltung nicht von PowerShell/Add-Type oder externen Libraries ab.
+
+def _windows_process_ids(process_name: str) -> set[int]:
+    """Findet passende laufende Prozess-IDs über tasklist."""
+    import csv
+    import io
+
+    wanted = {
+        Path(process_name).stem.casefold(),
+        Path(process_name).name.casefold(),
+    }
+    # Zusätzliche bekannte Namen, da Electron-App und Hauptprozess je nach
+    # TurboWarp-Version unterschiedlich benannt sein können.
+    if any("turbowarp" in name for name in wanted):
+        wanted.update({
+            "turbowarp.exe", "turbowarp",
+            "turbowarp desktop.exe", "turbowarp desktop",
+            "turbowarp-desktop.exe", "turbowarp-desktop",
+            "turbowarpdesktop.exe", "turbowarpdesktop",
+        })
+
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=6
+        )
+        ids: set[int] = set()
+        for row in csv.reader(io.StringIO(result.stdout)):
+            if len(row) >= 2 and row[0].strip().strip('"').casefold() in wanted:
+                try:
+                    ids.add(int(row[1].replace(",", "").strip()))
+                except ValueError:
+                    pass
+        return ids
+    except Exception:
+        return set()
 
 
-def _apply_geometry_windows(pname: str, geo: dict) -> bool:
-    """
-    Setzt Fenstergeometrie via SetWindowPos (zuverlässiger als MoveWindow für Electron).
-    SetWindowPos mit SWP_SHOWWINDOW | SWP_NOZORDER funktioniert auch wenn
-    MoveWindow von Electron ignoriert wird.
-    """
-    if geo.get("maximized"):
-        script = _WIN32_SCRIPT_HEADER + f"""
-$p = Get-Process -Name "{pname}" -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($p -and $p.MainWindowHandle -ne 0) {{
-    [WinHelper]::ShowWindow($p.MainWindowHandle, 3) | Out-Null
-    Write-Output "ok"
-}}
-"""
-    else:
-        x, y, w, h = geo["x"], geo["y"], geo["w"], geo["h"]
-        # SWP_SHOWWINDOW (0x40) | SWP_NOZORDER (0x04) | SWP_NOACTIVATE (0x10) = 0x54
-        script = _WIN32_SCRIPT_HEADER + f"""
-$p = Get-Process -Name "{pname}" -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($p -and $p.MainWindowHandle -ne 0) {{
-    $hwnd = $p.MainWindowHandle
-    # SW_RESTORE zuerst falls maximiert/minimiert
-    [WinHelper]::ShowWindow($hwnd, 9) | Out-Null
-    Start-Sleep -Milliseconds 300
+def _windows_find_window(process_name: str):
+    """Gibt (hwnd, user32, rect) für das sichtbare Hauptfenster zurück."""
+    if platform.system() != "Windows":
+        return None
 
-    # SetWindowPos ist zuverlässiger als MoveWindow für Electron-Apps
-    # Flags: SWP_SHOWWINDOW | SWP_NOZORDER | SWP_NOACTIVATE
-    $flags = [uint32]0x54
-    $hAfter = [IntPtr]::Zero
-    [WinHelper]::SetWindowPos($hwnd, $hAfter, {x}, {y}, {w}, {h}, $flags) | Out-Null
-    Start-Sleep -Milliseconds 200
-    # Zweiter Aufruf — Electron kann den ersten beim Laden überschreiben
-    [WinHelper]::SetWindowPos($hwnd, $hAfter, {x}, {y}, {w}, {h}, $flags) | Out-Null
+    import ctypes
+    from ctypes import wintypes
 
-    # Verifizierung: Lese Position zurück
-    $r = New-Object WinHelper+RECT
-    [WinHelper]::GetWindowRect($hwnd, [ref]$r) | Out-Null
-    $ax = $r.L; $ay = $r.T; $aw = $r.R - $r.L; $ah = $r.B - $r.T
-    Write-Output "set:$ax,$ay,${{aw}},${{ah}}"
-}}
-"""
-    out = _run_ps(script, timeout=10)
-    if out.startswith("set:"):
-        # Verifizieren: gesetzt? (8px Toleranz)
-        try:
-            parts = out[4:].split(",")
-            ax, ay, aw, ah = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
-            if abs(ax-geo["x"])>8 or abs(ay-geo["y"])>8:
-                print(f"  ⚠  Position nicht korrekt gesetzt: ist {ax},{ay} erwartet {geo['x']},{geo['y']}")
-                return False
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    user32.EnumWindows.argtypes = [EnumWindowsProc, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.GetWindowRect.restype = wintypes.BOOL
+    user32.IsZoomed.argtypes = [wintypes.HWND]
+    user32.IsZoomed.restype = wintypes.BOOL
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    user32.IsIconic.restype = wintypes.BOOL
+
+    pids = _windows_process_ids(process_name)
+    if not pids:
+        return None
+
+    found = []
+
+    @EnumWindowsProc
+    def callback(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
             return True
-        except Exception:
-            return True  # Setzen lief durch, Verifikation fehlgeschlagen
-    return out == "ok"
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value not in pids:
+            return True
+        title_len = user32.GetWindowTextLengthW(hwnd)
+        title_buf = ctypes.create_unicode_buffer(max(title_len + 1, 2))
+        user32.GetWindowTextW(hwnd, title_buf, len(title_buf))
+        if not title_buf.value.strip():
+            return True
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return True
+        width = rect.right - rect.left
+        height = rect.bottom - rect.top
+        if width < 200 or height < 200 or user32.IsIconic(hwnd):
+            return True
+        # Vorzugsweise das größte passende sichtbare Fenster nehmen, damit
+        # kleine Electron-Hilfsfenster nicht versehentlich ausgewählt werden.
+        found.append((
+            width * height, hwnd,
+            {
+                "x": int(rect.left), "y": int(rect.top),
+                "w": int(width), "h": int(height),
+                "maximized": bool(user32.IsZoomed(hwnd)),
+            },
+            user32,
+        ))
+        return True
 
+    user32.EnumWindows(callback, 0)
+    if not found:
+        return None
+    found.sort(key=lambda item: item[0], reverse=True)
+    _, hwnd, geo, user32 = found[0]
+    return hwnd, user32, geo
+
+
+def _get_window_geometry_windows(process_name: str) -> dict | None:
+    result = _windows_find_window(process_name)
+    return result[2] if result else None
+
+
+def _get_hwnd_windows(process_name: str) -> bool:
+    return _windows_find_window(process_name) is not None
+
+
+def _apply_geometry_windows(process_name: str, geo: dict) -> bool:
+    """Setzt die Fensterposition/-größe direkt über die Windows-API."""
+    result = _windows_find_window(process_name)
+    if not result:
+        return False
+
+    import ctypes
+    from ctypes import wintypes
+
+    hwnd, user32, _current_geo = result
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = wintypes.BOOL
+    user32.SetWindowPos.argtypes = [
+        wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, ctypes.c_uint
+    ]
+    user32.SetWindowPos.restype = wintypes.BOOL
+
+    SW_RESTORE = 9
+    SW_MAXIMIZE = 3
+    HWND_TOP = 0
+    SWP_NOACTIVATE = 0x0010
+    SWP_NOZORDER = 0x0004
+    SWP_SHOWWINDOW = 0x0040
+
+    if geo.get("maximized"):
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        time.sleep(0.15)
+        user32.ShowWindow(hwnd, SW_MAXIMIZE)
+        return True
+
+    user32.ShowWindow(hwnd, SW_RESTORE)
+    time.sleep(0.15)
+    flags = SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW
+    ok = user32.SetWindowPos(
+        hwnd, wintypes.HWND(HWND_TOP),
+        int(geo["x"]), int(geo["y"]), int(geo["w"]), int(geo["h"]),
+        flags
+    )
+    time.sleep(0.15)
+    actual = _get_window_geometry_windows(process_name)
+    if not actual:
+        return bool(ok)
+    tol = 12
+    return bool(ok) and all(
+        abs(actual[k] - geo[k]) <= tol for k in ("x", "y", "w", "h")
+    )
 
 def _apply_geometry_macos(app_name: str, geo: dict) -> bool:
     x, y, w, h = geo["x"], geo["y"], geo["w"], geo["h"]
@@ -2511,9 +2565,12 @@ def launch_app(sb3_path: str, app: str, replace: bool):
         print(f"  ⏹  Beende laufende {label}-Instanzen...")
         if system == "Windows":
             # Alle TurboWarp-Varianten beenden
-            for pname in ["TurboWarp Desktop", "TurboWarp", "turbowarp-desktop"]:
-                subprocess.run(["taskkill", "/F", "/IM", f"{pname}.exe"],
-                               capture_output=True)
+            for pname in [
+                "TurboWarp Desktop.exe", "TurboWarp.exe",
+                "turbowarp-desktop.exe", "turbowarpdesktop.exe",
+            ]:
+                subprocess.run(["taskkill", "/F", "/IM", pname],
+                               capture_output=True, timeout=8)
         else:
             subprocess.run(["pkill", "-f", kill], capture_output=True)
         time.sleep(0.8)
