@@ -2171,7 +2171,15 @@ def restore_window_state(app: str, process_name: str):
         # Electron setzt nach dem Rendern der Seite nochmal seine eigene
         # Startgröße. Wir müssen DANACH kommen — daher länger warten.
         # TurboWarp/Scratch brauchen auf schnellen Systemen ~2-3s zum Laden.
-        time.sleep(3.0)
+       # ── Schritt 2: Warten bis Electron da ist (dynamisch) ─────
+        # Statt starr 3 Sekunden zu warten, prüfen wir max. 2 Sekunden im 0.2s-Takt,
+        # ob das Fenster bereits existiert.
+        load_deadline = time.time() + 2.0
+        while time.time() < load_deadline:
+            if system == "Windows":
+                if _get_window_geometry_windows(pname) is not None:
+                    break
+            time.sleep(0.05)
 
         # ── Schritt 3+4: Setzen und verifizieren (bis zu 5 Versuche) ──
         tol = 12   # Pixel-Toleranz
