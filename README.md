@@ -25,8 +25,7 @@ Der Transpiler unterstützt die wichtigsten Scratch-Bausteine, Assets, Erweiteru
 - Python 3.10+
 - Optional: `Pillow` für Rasterbilder wie PNG/JPG/BMP/WebP
 - sudo apt install xdotool
-(Linux (nur nötig, wenn --turbowarp-replace / --scratch-replace genutzt wird))
-
+  (Linux (nur nötig, wenn --turbowarp-replace / --scratch-replace genutzt wird))
 
 Installation:
 
@@ -254,7 +253,242 @@ onFlagClicked {
 }
 ```
 
-### Ausdrücke und Operatoren
+---
+
+## Vollständige Scratch-Befehlsübersicht
+
+Die Sprache in J2sb3 ist bewusst Java-ähnlich, aber die Semantik entspricht den Scratch-Bausteinen. Die folgende Tabelle listet die wichtigsten Scratch-Befehle mit dem passenden J2sb3-Äquivalent.
+
+### 1) Events und Trigger
+
+| Scratch-Block | J2sb3-Äquivalent |
+|---|---|
+| Wenn grüne Flagge angeklickt | `onFlagClicked { ... }` |
+| Wenn Taste `x` gedrückt | `onKeyPressed("x") { ... }` |
+| Wenn ich angeklickt werde | `onSpriteClicked { ... }` |
+| Wenn Bühne zu `X` wechselt | `onBackdropChanged("X") { ... }` |
+| Wenn Nachricht `X` empfangen | `onBroadcastReceived("X") { ... }` |
+| Sende Nachricht `X` | `broadcast("X");` |
+| Sende Nachricht `X` und warte | `broadcastAndWait("X");` |
+
+### 2) Steuerung
+
+| Scratch-Block | J2sb3-Äquivalent |
+|---|---|
+| Wiederhole `N` mal | `repeat(N) { ... }` |
+| Für immer | `forever { ... }` |
+| Wenn `Bedingung` dann | `if (bedingung) { ... }` |
+| Wenn `Bedingung` dann, sonst | `if (bed) { ... } else { ... }` |
+| Wenn `Bedingung` dann, sonst wenn ... | `if (a) { ... } elseif (b) { ... } else { ... }` |
+| Warten `Sekunden` | `wait(sekunden);` |
+| Warte bis `Bedingung` | `waitUntil(bedingung);` |
+| Wiederhole bis `Bedingung` | `repeatUntil(bedingung) { ... }` |
+| Stoppe alles | `stop("all");` |
+| Stoppe dieses Skript | `stop("this script");` |
+| Stoppe andere Skripte in Sprite | `stop("other scripts in sprite");` |
+| Erzeuge Klon von `X` | `createClone("X");` |
+| Lösche diesen Klon | `deleteClone();` |
+
+### 3) Bewegung (Motion)
+
+| Scratch-Block | J2sb3-Äquivalent |
+|---|---|
+| Bewege `N` Schritte | `move(N);` |
+| Drehe nach links `N` Grad | `turnLeft(N);` |
+| Drehe nach rechts `N` Grad | `turnRight(N);` |
+| Gehe zu x: `X`, y: `Y` | `goTo(X, Y);` |
+| Gehe zu Sprite `X` | `goToSprite("X");` |
+| Gleite `Sekunden` zu x: `X`, y: `Y` | `glide(Sekunden, X, Y);` |
+| Gleite `Sekunden` zu Sprite `X` | `glideToSprite(Sekunden, "X");` |
+| Setze Richtung auf `N` Grad | `pointDir(N);` |
+| Schau auf `X` | `pointTowards("X");` |
+| Setze x auf `X` | `setX(X);` |
+| Setze y auf `Y` | `setY(Y);` |
+| Ändere x um `N` | `changeX(N);` |
+| Ändere y um `N` | `changeY(N);` |
+| Pralle am Rand ab | `bounceOnEdge();` |
+| Setze Rotationsstil | `setRotationStyle("all around");` |
+| Setze x-Position | `xPosition` |
+| Setze y-Position | `yPosition` |
+| Setze Richtung | `direction` |
+
+### 4) Aussehen (Looks)
+
+| Scratch-Block | J2sb3-Äquivalent |
+|---|---|
+| Sag `Text` | `say("Text");` |
+| Sag `Text` für `Sekunden` | `sayFor("Text", Sekunden);` |
+| Denk `Text` | `think("Text");` |
+| Denk `Text` für `Sekunden` | `thinkFor("Text", Sekunden);` |
+| Wechsle zu Kostüm `X` | `switchCostume("X");` |
+| Nächstes Kostüm | `nextCostume();` |
+| Wechsle zu Hintergrund `X` | `switchBackdrop("X");` |
+| Nächster Hintergrund | `nextBackdrop();` |
+| Setze Größe auf `N` | `setSize(N);` |
+| Ändere Größe um `N` | `changeSize(N);` |
+| Zeige dich an | `show();` |
+| Verstecke dich | `hide();` |
+| Bringe nach vorne | `goToFront();` |
+| Bringe nach hinten | `goToBack();` |
+| Bewege `N` Ebenen nach vorne | `goForwardLayers(N);` |
+| Bewege `N` Ebenen nach hinten | `goBackwardLayers(N);` |
+| Effekt `X` auf `N` setzen | `setEffect("X", N);` |
+| Effekt `X` um `N` ändern | `changeEffect("X", N);` |
+| Effekt löschen | `clearEffects();` |
+
+### 5) Klang (Sound)
+
+| Scratch-Block | J2sb3-Äquivalent |
+|---|---|
+| Spiel Klang `X` | `playSound("X");` |
+| Spiel Klang `X` vollständig | `playSoundUntilDone("X");` |
+| Stoppe alle Klänge | `stopAllSounds();` |
+| Setze Lautstärke auf `N` | `setVolume(N);` |
+| Ändere Lautstärke um `N` | `changeVolume(N);` |
+
+### 6) Ereignisse und Sensoren (Sensing)
+
+| Scratch-Block | J2sb3-Äquivalent |
+|---|---|
+| Frage `Text` und warte | `askAndWait("Text");` |
+| Setze Ziehmodus | `setDragMode("draggable");` |
+| Timer zurücksetzen | `resetTimer();` |
+| Antwort | `answer` |
+| Maus x | `mouseX` |
+| Maus y | `mouseY` |
+| Maus gedrückt? | `mouseDown` |
+| Taste `X` gedrückt? | `keyPressed("X")` |
+| Berührt `X`? | `touching("X")` |
+| Berührt Farbe `X`? | `touchingColor(X)` |
+| Abstand zu `X` | `distanceTo("X")` |
+| Timer | `timer` |
+| Lautstärke | `loudness` |
+| Benutzername | `username` |
+| Aktuelles Jahr | `currentYear` |
+| Aktueller Monat | `currentMonth` |
+| Aktueller Tag | `currentDate` |
+| Aktueller Wochentag | `currentDayOfWeek` |
+| Aktuelle Stunde | `currentHour` |
+| Aktuelle Minute | `currentMinute` |
+| Aktuelle Sekunde | `currentSecond` |
+
+### 7) Stift (Pen)
+
+| Scratch-Block | J2sb3-Äquivalent |
+|---|---|
+| Stift herunter | `penDown();` |
+| Stift hoch | `penUp();` |
+| Setze Stiftfarbe auf `N` | `setPenColor(N);` |
+| Ändere Stiftfarbe um `N` | `changePenColor(N);` |
+| Setze Stiftbreite auf `N` | `setPenSize(N);` |
+| Ändere Stiftbreite um `N` | `changePenSize(N);` |
+| Stempel setzen | `stampPen();` |
+| Lösche alles | `erasePen();` |
+
+### 8) Variablen und Listen
+
+| Scratch-Block | J2sb3-Äquivalent |
+|---|---|
+| Variable deklarieren | `var x = 0;` |
+| Variable setzen | `x = 5;` |
+| Variable erhöhen | `x++;` oder `x += 2;` |
+| Variable anzeigen | `showVar;` oder `showVar("x");` |
+| Variable verstecken | `hideVar;` oder `hideVar("x");` |
+| Liste hinzufügen | `liste.add(item);` |
+| Liste einfügen | `liste.insert(index, item);` |
+| Listenwert löschen | `liste.delete(index);` |
+| Listenwert ersetzen | `liste.replace(index, item);` |
+| Länge einer Liste | `meineListe.length` |
+| Element aus Liste lesen | `meineListe[0]` |
+| Ob Listeneintrag enthalten ist | `meineListe.contains(item)` |
+| Liste anzeigen | `showList("name");` |
+| Liste verstecken | `hideList("name");` |
+
+### 9) Operatoren und Funktionen
+
+| Scratch-Block / Funktion | J2sb3-Äquivalent |
+|---|---|
+| Addition | `a + b` |
+| Subtraktion | `a - b` |
+| Multiplikation | `a * b` |
+| Division | `a / b` |
+| Modulo | `a % b` |
+| Gleich | `a == b` |
+| Ungleich | `a != b` |
+| Kleiner | `a < b` |
+| Größer | `a > b` |
+| Kleiner gleich | `a <= b` |
+| Größer gleich | `a >= b` |
+| Und | `a && b` |
+| Oder | `a || b` |
+| Nicht | `!a` |
+| Zufallszahl | `random(1, 10)` |
+| Absolutwert | `Math.abs(-5)` |
+| Runde | `Math.round(3.7)` |
+| Wurzel | `Math.sqrt(16)` |
+| Sinus | `Math.sin(x)` |
+| Kosinus | `Math.cos(x)` |
+| Tangens | `Math.tan(x)` |
+| Logarithmus | `Math.log(x)` |
+| Natürlicher Logarithmus | `Math.ln(x)` |
+| Länge eines Strings | `length(text)` |
+| Zeichen an Position `N` | `letter(N, text)` |
+| Enthält Teilstring? | `contains(text, "x")` |
+| Verknüpfe Zeichenketten | `join("Hallo", " Welt")` |
+
+### 10) Eigene Blöcke (Custom Blocks)
+
+```java
+define quadrat(size) {
+    repeat(4) {
+        move(size);
+        turnRight(90);
+    }
+}
+
+onFlagClicked {
+    quadrat(100);
+}
+```
+
+Optionale Typannotationen:
+
+```java
+define moveTo(number x, number y) {
+    goTo(x, y);
+}
+
+void sayHello(string name) {
+    say("Hallo " + name);
+}
+```
+
+Typen im Transpiler:
+
+- `number` / `int` / `float` → numerisch
+- `string` / `str` → Text
+- `boolean` / `bool` → Boolescher Wert
+
+### 11) Unterstützte Scratch-Erweiterungen
+
+```java
+import "pen";
+import "music";
+import "video";
+import "text2speech";
+import "translate";
+import "microbit";
+import "ev3";
+import "boost";
+import "wedo";
+import "gdxfor";
+```
+
+Dies erlaubt den Import von Scratch-Erweiterungen, die in Scratch-Projekten als Zusatzblöcke verfügbar sind.
+
+---
+
+## Ausdrücke und Operatoren
 
 ```java
 x + y
@@ -292,7 +526,7 @@ Der Transpiler meldet verständliche Fehler mit Zeilennummern:
 
 ```text
 ✗  Sprite 'Katze': switchCostume("GibtNicht") – nicht definiert.
-   Vorhanden: ['Cat-a', 'Cat-b']
+    Vorhanden: ['Cat-a', 'Cat-b']
 ```
 
 Warnungen (`⚠`) werden zwar angezeigt, aber die `.sb3`-Datei kann trotzdem erzeugt werden.
@@ -335,4 +569,4 @@ Dieses Projekt steht unter der MIT-Lizenz. Siehe `LICENSE`.
 
 ## Hinweis
 
-Die vollständige Syntax- und Funktionsreferenz liegt in dieser README zusammen mit den Beispielen und der CLI-Dokumentation vor. Für die aktuelle Nutzung ist der direkte Aufruf über `python Transpiler.py --help` die beste Referenz, da die Kommandzeilenoptionen und die reale Implementierung immer mit der aktuellen Version übereinstimmen.
+Die vollständige Syntax- und Funktionsreferenz liegt in dieser README zusammen mit den Beispielen und der CLI-Dokumentation vor. Für die aktuelle Nutzung ist der direkte Aufruf über `python Transpiler.py ...` ausreichend.
